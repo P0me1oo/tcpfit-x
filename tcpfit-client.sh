@@ -1,7 +1,7 @@
 #!/bin/sh
 # tcpfit 回国测速端：兼容常规 Linux、OpenWrt、iStoreOS 的 /bin/sh。
 # 本脚本只安装缺少的工具、主动连接和回报测量；不修改网络参数或启动入站服务。
-TCPFIT_CLIENT_VERSION="0.7.0"
+TCPFIT_CLIENT_VERSION="0.6.0"
 set -u
 umask 077
 

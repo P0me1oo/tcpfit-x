@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.7.0"
+VERSION = "0.6.0"
 MAX_BODY = 2 * 1024 * 1024
 HEARTBEAT_TIMEOUT = 45
 TASK_TIMEOUT = 1800

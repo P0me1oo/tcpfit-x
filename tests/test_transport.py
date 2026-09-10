@@ -50,8 +50,8 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/pair", headers)[0], 409)
         self.firewall.pair.assert_called_once_with("127.0.0.1")
 
-    def test_old_protocol_is_rejected_before_pairing(self):
-        headers = {"Authorization": "Pair " + self.coordinator.token, "X-Tcpfit-Version": "0.6.0"}
+    def test_mismatched_version_is_rejected_before_pairing(self):
+        headers = {"Authorization": "Pair " + self.coordinator.token, "X-Tcpfit-Version": "0.0.0"}
         self.assertEqual(self.request("POST", "/pair", headers)[0], 409)
         self.assertIsNone(self.coordinator.peer)
         self.firewall.pair.assert_not_called()
