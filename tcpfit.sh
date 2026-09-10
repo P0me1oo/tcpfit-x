@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # tcpfit — 单机 TCP 调优代理
 #
-# 纯 bash, 除 iperf3(仅 sweep 需要) 外无依赖, 可在任何最小化 VPS 上直接跑.
+# 原版调优使用 bash；回国双端模式另需 Python 3、curl、openssl 和 iperf3。
 # 所有"该设多少"的判断都由实测或机器规格推导, 不使用抄来的固定值.
 #
 # 用法:
 #   tcpfit.sh                               交互式菜单（不带参数即可, 推荐）
+#   tcpfit.sh return [选项]                  回国调优（家宽主动接入，仅服务器调参）
+#   tcpfit.sh return-recover                 重试未完成的回国任务恢复
 #   tcpfit.sh detect                        输出机器画像
 #   tcpfit.sh probe  --peer HOST            探测可用带宽(虚拟网卡读不到标称值时用)
 #   tcpfit.sh tune   [选项]                 应用基础调优
@@ -31,7 +33,9 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.7"
+VERSION="0.6.0"
+REPO="P0me1oo/tcpfit-x"
+SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -78,53 +82,16 @@ _conf(){ printf '      %s %s\n' "$(_pad "$1" 14)" "$2"; }
 
 # 同时跑两个实例会同时抢 qdisc、快照和 sysctl. 用文件锁串行化.
 LOCK_FILE="/var/lock/tcpfit.lock"
+LOCK_HELD=0
 take_lock(){
-  command -v flock >/dev/null || return 0
-  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
-  # 注意不能写成 exec 9>FILE 2>/dev/null —— 那个 2>/dev/null 会被 exec 当成
-  # 永久重定向, 把整个脚本的 stderr 都吞掉, 所有 die/warn 就都看不见了.
-  [ -w "$(dirname "$LOCK_FILE")" ] || return 0
-  exec 9>"$LOCK_FILE" || return 0
-  flock -n 9 && return 0
-
-  # 锁被占: 可能真有另一个在跑, 也可能是上次异常退出(SSH 断线/被 kill)卡住了.
-  # 给出持有者和已运行时长, 让用户能判断, 并提供一键结束 —— 光说"等它结束"
-  # 遇到卡死的情况没有出路. 而且 bash <(curl ...) 起的进程 cmdline 是
-  # /dev/fd/63, 用 pkill -f tcpfit 根本找不到它.
-  local pids age
-  # 排除自己 —— 上面已经 exec 9> 打开了锁文件, 不排掉会把自己也列成持有者
-  pids=$(fuser "$LOCK_FILE" 2>/dev/null | tr -s ' ' | tr ' ' '\n' | grep -vx "$$" | grep -x '[0-9]*' | tr '\n' ' ')
-  [ -n "$pids" ] || pids=$(command -v lsof >/dev/null && lsof -t "$LOCK_FILE" 2>/dev/null | grep -vx "$$" | tr '\n' ' ')
-  warn "另一个 tcpfit 正在运行（锁: $LOCK_FILE）"
-  if [ -n "$pids" ]; then
-    echo "      持有者:"
-    for _p in $pids; do
-      age=$(ps -o etime= -p "$_p" 2>/dev/null | tr -d ' ')
-      [ -n "$age" ] && printf '        PID %-8s 已运行 %s\n' "$_p" "$age"
-    done
-  fi
-  echo "      跑得太久多半是上次异常退出卡住了."
-  echo
-  # 拿不到 PID 就没法安全地只杀它们, 不如让用户自己处理
-  [ -n "$pids" ] || die "查不到锁的持有者, 手动检查: fuser -v $LOCK_FILE"
-  if confirm "  结束它并继续？" n; then
-    exec 9>&-                                   # 先松开自己, 否则会把自己一起杀掉
-    # 只杀最初记录的那几个 PID. 绝不能第二次去查锁文件 ——
-    # 旧实例收到 TERM 退出后, 别的新实例可能在这 3 秒里拿到锁,
-    # 再查一次就会把那个无辜的新实例 KILL 掉(实测复现过, 新实例退出码 137).
-    kill -TERM $pids 2>/dev/null            # 先 TERM, 让对方的 trap 有机会恢复 qdisc
-    sleep 3
-    for _p in $pids; do
-      kill -0 "$_p" 2>/dev/null && kill -KILL "$_p" 2>/dev/null
-    done
-    sleep 1
-    reap_iperf
-    exec 9>"$LOCK_FILE" || return 0
-    flock -n 9 || die "锁仍被占用, 手动查看: fuser -v $LOCK_FILE"
-    ok "已结束, 继续"
-    return 0
-  fi
-  die "已取消"
+  # 同一流程会多次调用 tune/shape；保留同一个描述符，避免重开时短暂释放锁。
+  [ "$LOCK_HELD" = 1 ] && return 0
+  command -v flock >/dev/null || die "缺少 flock，请先安装 util-linux；未启动调优"
+  mkdir -p "$(dirname "$LOCK_FILE")" || die "无法创建任务锁目录"
+  exec 9>>"$LOCK_FILE" || die "无法打开任务锁: $LOCK_FILE"
+  flock -n 9 || die "已有 tcpfit 任务正在运行，请等待其结束后重试（锁: $LOCK_FILE）"
+  [ "${1:-}" = recovery ] || [ ! -f "$STATE_DIR/return-pending.json" ] || die "存在尚未恢复完成的回国任务，请先执行 tcpfit return-recover"
+  LOCK_HELD=1
 }
 
 need_root(){ [ "$(id -u)" = 0 ] || die "需要 root 权限"; }
@@ -331,12 +298,12 @@ disp(){
 # 为什么不能直接复制"正在运行的脚本"：bash <(curl ...) 时 $0 是 /dev/fd/63,
 # 内容已被 bash 读走, 再 cat 只能读到 0 字节；curl | bash 时 $0 = bash, 根本不可读.
 # 实测验证过这两种情况. 所以只能按版本号回拉, 并校验拉到的确实是同一版.
-SELF_URL="https://raw.githubusercontent.com/Kylin010/tcpfit/v${VERSION}/tcpfit.sh"
+SELF_URL="https://raw.githubusercontent.com/${REPO}/v${VERSION}/tcpfit.sh"
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac      # 已经是装好的那份
   command -v curl >/dev/null || return 0
-  curl -fsSL "$SELF_URL" -o "$SELF_PATH".tmp 2>/dev/null || return 0
+  curl -fsSL "$SELF_URL" -o "$SELF_PATH".tmp 2>/dev/null || { rm -f "$SELF_PATH".tmp; return 0; }
   # 校验版本一致. 开发期 main 领先 tag 时这里会失败, 跳过安装也是对的.
   if [ -s "$SELF_PATH".tmp ] && starts_with "$(head -1 "$SELF_PATH".tmp 2>/dev/null)" '#!' \
      && grep -q "^VERSION=\"$VERSION\"" "$SELF_PATH".tmp; then
@@ -998,6 +965,9 @@ archive_write(){
     [ -n "${ARCH_BW:-}"   ] && echo "PARAM_BW=$ARCH_BW"
     [ -n "${ARCH_RTT:-}"  ] && echo "PARAM_RTT=$ARCH_RTT"
     [ -n "${ARCH_PEER:-}" ] && echo "PARAM_PEER=$ARCH_PEER"
+    [ -n "${ARCH_MODE:-}" ] && echo "PARAM_MODE=$ARCH_MODE"
+    [ -n "${ARCH_RUN:-}" ] && echo "PARAM_RUN=$ARCH_RUN"
+    [ -n "${ARCH_RETURN_SNAPSHOT:-}" ] && echo "RETURN_SNAPSHOT=$ARCH_RETURN_SNAPSHOT"
     echo "SHAPE_RATE=${rate:-none}"
     [ "${ARCH_INCLUDE_SWEEP:-1}" = 1 ] && [ -f "$STATE_DIR/sweep.result" ] &&
       sed 's/^/SWEEP_/' "$STATE_DIR/sweep.result"
@@ -1155,6 +1125,15 @@ archive_restore(){
   local f="$1" iface rate route was_cc was_rmem was_rate now_cc now_rmem now_rate
   local tmp k v failed=0
   [ -r "$f" ] && [ -f "$f" ] || { warn "无法读取存档: $f"; return 1; }
+  local return_snapshot
+  return_snapshot=$(sed -n 's/^RETURN_SNAPSHOT=//p' "$f")
+  if [ -n "$return_snapshot" ]; then
+    [ -f "$return_snapshot" ] || { warn "回国完整配置文件缺失: $return_snapshot，未执行部分恢复"; return 1; }
+    return_assets || { warn "无法加载回国恢复模块"; return 1; }
+    python3 "$RETURN_HELPER" restore --snapshot "$return_snapshot" --lock-fd 9 || return 1
+    ok "已恢复存档 $(archive_seq_of "$f") 的完整参数、队列和持久化配置"
+    return 0
+  fi
   # 出厂回滚必须移除持久化入口，与 rollback 使用同一路径。
   if [ "$(archive_seq_of "$f")" = 0000 ]; then
     local SNAPSHOT="$f"
@@ -1307,7 +1286,7 @@ cmd_uninstall(){
   else
     echo "    5. 删掉 $STATE_DIR（存档和快照, 之后无法再回滚）"
   fi
-  echo "    6. 删掉 $SELF_PATH 本身"
+  echo "    6. 删掉 $SELF_PATH 和 /usr/local/lib/tcpfit 中的程序模块"
   echo
   echo "  不会碰: swap（要删自己 swapoff）、iperf3、ping 等装过的包."
   echo
@@ -1321,6 +1300,7 @@ cmd_uninstall(){
 
   # 保留当前脚本到最后；旧入口清理失败时也保留存档，便于重试。
   rm -f "$LEGACY_SELF" 2>/dev/null || { warn "旧入口删除失败: $LEGACY_SELF，已停止卸载"; return 1; }
+  rm -rf /usr/local/lib/tcpfit || { warn "程序模块删除失败，已保留当前脚本供重试"; return 1; }
   if [ "$keep_archives" = 1 ]; then
     info "存档保留在 $STATE_DIR"
   else
@@ -2007,10 +1987,18 @@ probe_bandwidth(){
   trap 'qdisc_restore; exit 130' INT TERM HUP
   # 用 fq 做 pacing 但不设上限: 既避免突发打穿限速器, 又能探到真实上限
   qdisc_set_fq "$iface" || { qdisc_restore; echo ""; return 1; }
-  local res gp
-  for a in 1 2 3; do res=$(run_iperf "$peer" "$dur" 4); [ -n "$res" ] && break; sleep 8; done
+  local bw
+  bw=$(measure_bandwidth "$peer" "$dur")
   trap - INT TERM HUP
   qdisc_restore
+  [ -n "$bw" ] || return 1
+  printf '%s' "$bw"
+}
+
+# 两种调优共用四连接探测与取整；队列的事务由各自入口负责。
+measure_bandwidth(){
+  local peer="$1" dur="${2:-10}" res="" gp a
+  for a in 1 2 3; do res=$(run_iperf "$peer" "$dur" 4); [ -n "$res" ] && break; sleep 8; done
   [ -n "$res" ] || { echo ""; return 1; }
   # run_iperf 第三列是接收端实际送达量. 老版 iperf3 没给 receiver 汇总时
   # 第三列为空, 退回使用既有的发送端数字.
@@ -2059,6 +2047,11 @@ cmd_probe(){
 # 公共节点各开十个实例（Leaseweb/OVH 5201-5210, Clouvider 5200-5209）,
 # 指定端口忙时自动换 —— 否则单端口一忙就整个失败. 端口表见 PORT_POOL.
 run_iperf(){
+  if [ -n "${TCPFIT_RETURN_RUN:-}" ]; then
+    python3 "$TCPFIT_RETURN_HELPER" measure --run-dir "$TCPFIT_RETURN_RUN" \
+      --duration "$2" --streams "$3" --stage "$TCPFIT_RETURN_STAGE"
+    return $?
+  fi
   local out recv raw tmp port ports pid sg rt rg="" first="${4:-${PEER_PORT:-5201}}"
   ports=$(port_order "$first")
   tmp=$(mktemp)
@@ -2092,7 +2085,8 @@ run_iperf(){
   else                     printf '%s %s\n'    "$sg" "$rt"; fi
 }
 
-# 丢包率(%) = 重传数 / 发出的包数. 包数按 1448 字节 MSS 估算.
+# 估算重传比(%) = 重传次数 / 按 1448 字节 MSS 估算的发送段数。
+# 这是沿用历史阈值的比较指标，不是实际丢包率；实际重传次数单独展示。
 #
 # 为什么不能用绝对次数：阈值 100 在 300M 机上相当于 0.032% 丢包,
 # 在 7.4G 机上只有 0.0014% —— 严了 25 倍. 实测踩过：一台 10G 口的机器
@@ -2110,12 +2104,26 @@ loss_pct(){   # loss_pct <重传数> <吞吐Mbps> <秒数>
   }'
 }
 
+# 公共节点扫描和回国验证共用判据；回国模式不另选算法或缓冲区候选。
+RETRANS_THRESHOLD=0.1
+VERIFY_GOOD_PCT=90
+VERIFY_ACCEPT_PCT=75
+retrans_is_spike(){
+  awk -v l="$1" -v b="$2" -v t="${3:-$RETRANS_THRESHOLD}" 'BEGIN{
+    need=t; if(b>0 && b*5>need) need=b*5; if(need>1) need=1
+    exit !(l>need)
+  }'
+}
+retrans_band(){
+  awk -v l="$1" 'BEGIN{if(l<0.05) print 0; else if(l<0.5) print 1; else if(l<1) print 2; else print 3}'
+}
+
 cmd_sweep(){
   need_root
   take_lock
   command -v iperf3 >/dev/null || die "需要 iperf3: apt install -y iperf3 / yum install -y iperf3"
   # GAP: 档与档之间的静置时间, 让上一条流的状态排空, 避免相邻两档互相干扰
-  local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh=0.1 refine=1 GAP=3 cap=10000
+  local peer="" nominal="" lo="" hi="" step="" dur=12 par=1 margin="" thresh="$RETRANS_THRESHOLD" refine=1 GAP=3 cap=10000
   local PRE_SCAN_GAP=15 BASELINE_CAP=0.5
   # cap 和 AGG_MIN 是两件事, 早期版本共用一个值, 抬 cap 会连带改掉"多大算大机器":
   #   cap     —— 愿意扫到多高（--cap 可调）
@@ -2179,13 +2187,7 @@ cmd_sweep(){
   # 0.1%-0.3% 的稳定底噪, 所以用 5 倍本底; 同时把相对阈值封顶在 1%,
   # 避免底噪把实测 1.35% 以上的 policer 拐点完全遮住.
   is_spike(){
-    awk -v l="$1" -v t="$thresh" -v b="${BASE_LOSS:-0}" 'BEGIN{
-      need=t
-      if (b > 0 && b*5 > need) need=b*5
-      if (need > 1) need=1
-      if (l <= need) exit 1
-      exit 0
-    }' 2>/dev/null
+    retrans_is_spike "$1" "${BASE_LOSS:-0}" "$thresh"
   }
   scan_range(){
     local a b st r res sgp gp rt lp prev_gp=0 verdict
@@ -2599,6 +2601,7 @@ verify_measure(){
     VS4=$(echo "$res"|awk '{print $1}'); VR4=$(echo "$res"|awk '{print $2}')
     VG4=$(echo "$res"|awk '{print $3}'); [ -n "$VG4" ] || VG4="$VS4"
   }
+  [ -n "$VG1" ] && [ -n "$VR1" ] && [ -n "$VG4" ] && [ -n "$VR4" ]
 }
 
 # 打印验证结果表 + 结论. $1 = 当前整形值(Mbit, 可空)
@@ -2617,15 +2620,15 @@ verify_verdict(){
   [ -n "$VS1" ] && [ -n "$VR1" ] && lp1=$(loss_pct "$VR1" "$VS1" "$VDUR")
   [ -n "$VS4" ] && [ -n "$VR4" ] && lp4=$(loss_pct "$VR4" "$VS4" "$VDUR")
   echo "  验证"
-  printf '      %s %s %s %s\n' "$(_pad "" 14)" "$(_rpad "吞吐 Mbps" 12)" "$(_rpad "重传" 9)" "$(_rpad "丢包率" 10)"
+  printf '      %s %s %s %s\n' "$(_pad "" 14)" "$(_rpad "吞吐 Mbps" 12)" "$(_rpad "重传" 9)" "$(_rpad "估算重传比" 10)"
   printf '      %s %s %s %s\n' "$(_pad "单流" 14)"     "$(_rpad "${VG1:-测试失败}" 12)" "$(_rpad "${VR1:--}" 9)" "$(_rpad "${lp1:+${lp1}%}" 10)"
   printf '      %s %s %s %s\n' "$(_pad "4 流并发" 14)" "$(_rpad "${VG4:-测试失败}" 12)" "$(_rpad "${VR4:--}" 9)" "$(_rpad "${lp4:+${lp4}%}" 10)"
   echo
   # 吞吐和整形值比, 给结论而不是丢一堆数字
   if [ -n "$VG4" ] && [ -n "$target" ] && [ "$target" -gt 0 ] 2>/dev/null; then
     local pct; pct=$(awk -v a="$VG4" -v b="$target" 'BEGIN{printf "%.0f", a*100/b}')
-    if   [ "$pct" -ge 90 ] 2>/dev/null; then ok "达到整形值的 ${pct}%, 端口能力正常"
-    elif [ "$pct" -ge 75 ] 2>/dev/null; then info "达到整形值的 ${pct}%, 偏低但可接受（对端可能被其他人占用）"
+    if   [ "$pct" -ge "$VERIFY_GOOD_PCT" ] 2>/dev/null; then ok "达到整形值的 ${pct}%, 端口能力正常"
+    elif [ "$pct" -ge "$VERIFY_ACCEPT_PCT" ] 2>/dev/null; then info "达到整形值的 ${pct}%, 偏低但可接受（对端可能被其他人占用）"
     else warn "只达到整形值的 ${pct}%, 建议换个对端重测"; fi
   fi
   [ -n "$lp4" ] || return 0
@@ -2636,10 +2639,12 @@ verify_verdict(){
   else
     advice="这台没有应用整形. 高丢包来自链路本身或未被识别的限速器, 可以跑菜单 3 试着扫一次拐点"
   fi
-  if   awk -v l="$lp4" 'BEGIN{exit !(l < 0.05)}'; then ok   "丢包 ${lp4}%, 链路干净"
-  elif awk -v l="$lp4" 'BEGIN{exit !(l < 0.5)}';  then ok   "丢包 ${lp4}%, 略高, 通常不影响"
-  elif awk -v l="$lp4" 'BEGIN{exit !(l < 1)}';    then warn "丢包 ${lp4}%, 偏高 —— ${advice}"
-  else                                                 warn "丢包 ${lp4}%, 很糟 —— ${advice}"; fi
+  case "$(retrans_band "$lp4")" in
+    0) ok "估算重传比 ${lp4}%, 较低" ;;
+    1) ok "估算重传比 ${lp4}%, 略高" ;;
+    2) warn "估算重传比 ${lp4}%, 偏高 —— ${advice}" ;;
+    3) warn "估算重传比 ${lp4}%, 很高 —— ${advice}" ;;
+  esac
 }
 
 cmd_verify(){
@@ -2667,6 +2672,7 @@ cmd_verify(){
   echo
   command -v iperf3 >/dev/null || { warn "无 iperf3, 跳过实测"; return 0; }
 
+  take_lock
   verify_measure "$peer"
   verify_verdict "$shaper"
   rule
@@ -2675,6 +2681,7 @@ cmd_verify(){
 # ── 检查更新 ────────────────────────────────────────────────────────────────
 cmd_update(){
   need_root
+  take_lock
   command -v curl >/dev/null || die "需要 curl"
   # 菜单调进来时带 --from-menu: 更新完要用新版本 exec 掉自己, 否则用户在同一个
   # 菜单里接着操作, 跑的仍是内存里的旧代码.
@@ -2683,9 +2690,9 @@ cmd_update(){
   info "检查更新…"
   local latest
   # 只看 release, 不看 main —— main 可能领先于任何已发布版本
-  latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/Kylin010/tcpfit/releases/latest" 2>/dev/null \
+  latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
            | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/')
-  [ -n "$latest" ] || die "查不到最新版本, 检查网络或稍后再试" 2
+  [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "查不到有效的最新版本, 检查网络或稍后再试" 2
 
   if [ "$latest" = "$VERSION" ]; then ok "已是最新版本 v$VERSION"; return 0; fi
   # 用 sort -V 比版本号, 字符串比较会把 0.3.10 判成小于 0.3.9
@@ -2696,28 +2703,41 @@ cmd_update(){
   echo
   _conf "当前版本" "v$VERSION"
   _conf "最新版本" "v$latest"
-  _conf "更新说明" "https://github.com/Kylin010/tcpfit/releases/tag/v$latest"
+  _conf "更新说明" "https://github.com/$REPO/releases/tag/v$latest"
   echo
   confirm "  现在更新？" y || { info "已取消"; return 0; }
 
-  # 从 release 下, 用发布的 SHA256SUMS 校验. 只对比 tcpfit.sh 那一行 ——
-  # SHA256SUMS 里还有 install.sh, 直接 sha256sum -c 会因为文件不在而失败.
+  # 主程序和回国模块必须来自同一版本，并逐个通过发布清单校验。
+  command -v sha256sum >/dev/null || die "需要 sha256sum 校验更新文件"
   local dl; dl=$(mktemp -d)
-  local base="https://github.com/Kylin010/tcpfit/releases/download/v$latest"
+  local base="https://github.com/$REPO/releases/download/v$latest"
   if ! curl -fsSL --max-time 60 "$base/tcpfit.sh" -o "$dl/tcpfit.sh"; then
     rm -rf "$dl"; die "下载失败" 2
   fi
-  if command -v sha256sum >/dev/null && curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$dl/SHA256SUMS"; then
+  if curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$dl/SHA256SUMS"; then
     if ! ( cd "$dl" && grep ' tcpfit\.sh$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1 ); then
       rm -rf "$dl"; die "SHA256 校验不通过, 未更新" 2
     fi
     info "SHA256 校验通过"
   else
-    warn "取不到 SHA256SUMS 或没有 sha256sum, 退回版本号校验"
+    rm -rf "$dl"; die "取不到 SHA256SUMS，未更新" 2
   fi
   if ! { starts_with "$(head -1 "$dl/tcpfit.sh" 2>/dev/null)" '#!' && grep -q "^VERSION=\"$latest\"" "$dl/tcpfit.sh"; }; then
     rm -rf "$dl"; die "下载的文件校验不通过, 未更新" 2
   fi
+  local f lib_dir="/usr/local/lib/tcpfit/$latest"
+  for f in tcpfit-return.py tcpfit-client.sh; do
+    if ! curl -fsSL --max-time 60 "$base/$f" -o "$dl/$f" || \
+       ! (cd "$dl" && grep -F "  $f" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
+      rm -rf "$dl"; die "回国模块 $f 下载或校验失败，未更新" 2
+    fi
+  done
+  mkdir -p "$lib_dir" || { rm -rf "$dl"; die "无法创建模块目录"; }
+  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+    install -m 755 "$dl/$f" "$lib_dir/$f.new" && mv -f "$lib_dir/$f.new" "$lib_dir/$f" || {
+      rm -rf "$dl"; die "模块安装失败，主程序未更新";
+    }
+  done
   # 不能原地覆盖 —— 正在执行的就是 $SELF_PATH, 而 bash 是按文件偏移增量读脚本的,
   # 原地改写有可能让它读到新文件的错位内容（两个版本长度还不一样）.
   # 先写同目录的 .new 再 mv: rename 是原子的, 换新 inode, 旧 inode 对当前进程保持有效.
@@ -2737,6 +2757,136 @@ cmd_update(){
     exec "$SELF_PATH" menu
   fi
   warn "当前进程跑的仍是 v${VERSION} 的代码, 重新运行 tcpfit 才会用上新版本."
+}
+
+# ── 回国调优 ────────────────────────────────────────────────────────────────
+# 回国模块只负责接入、事务和路径数据；参数推导、基础调优及验证仍调用本文件。
+return_assets(){
+  local here dest dl f
+  here=$(cd "$(dirname "$SOURCE_FILE")" 2>/dev/null && pwd)
+  if [ -f "$here/tcpfit.sh" ] && [ -f "$here/tcpfit-return.py" ] && [ -f "$here/tcpfit-client.sh" ]; then
+    RETURN_MAIN="$here/tcpfit.sh"; RETURN_HELPER="$here/tcpfit-return.py"; RETURN_CLIENT="$here/tcpfit-client.sh"
+    return 0
+  fi
+  dest="/usr/local/lib/tcpfit/$VERSION"
+  if [ ! -f "$dest/tcpfit-return.py" ] || [ ! -f "$dest/tcpfit-client.sh" ] || [ ! -f "$dest/tcpfit.sh" ]; then
+    mkdir -p /usr/local/lib/tcpfit || return 1
+    dl=$(mktemp -d /usr/local/lib/tcpfit/.download.XXXXXX) || return 1
+    local base="https://raw.githubusercontent.com/$REPO/v$VERSION"
+    curl -fsSL --max-time 30 "$base/SHA256SUMS" -o "$dl/SHA256SUMS" || { rm -rf "$dl"; return 1; }
+    for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+      curl -fsSL --max-time 60 "$base/$f" -o "$dl/$f" || { rm -rf "$dl"; return 1; }
+      (cd "$dl" && grep -F "  $f" SHA256SUMS | sha256sum -c - >/dev/null 2>&1) || { rm -rf "$dl"; return 1; }
+    done
+    mkdir -p "$dest" || { rm -rf "$dl"; return 1; }
+    for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+      install -m 755 "$dl/$f" "$dest/$f" || { rm -rf "$dl"; return 1; }
+    done
+    rm -rf "$dl"
+  fi
+  RETURN_MAIN="$dest/tcpfit.sh"; RETURN_HELPER="$dest/tcpfit-return.py"; RETURN_CLIENT="$dest/tcpfit-client.sh"
+}
+
+return_dependencies(){
+  local c pkg missing=()
+  for c in python3 iperf3 openssl curl iptables; do
+    command -v "$c" >/dev/null || missing+=("$c")
+  done
+  [ "$IP_FAMILY" != -6 ] || command -v ip6tables >/dev/null || missing+=(iptables)
+  [ "${#missing[@]}" = 0 ] && return 0
+  info "安装回国调优依赖: ${missing[*]}"
+  if command -v apt-get >/dev/null; then
+    command -v debconf-set-selections >/dev/null && printf 'iperf3 iperf3/start_daemon boolean false\n' | debconf-set-selections
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+  elif command -v dnf >/dev/null; then dnf install -y "${missing[@]}"
+  elif command -v yum >/dev/null; then yum install -y "${missing[@]}"
+  elif command -v apk >/dev/null; then apk add "${missing[@]}"
+  elif command -v pacman >/dev/null; then
+    for pkg in "${missing[@]}"; do [ "$pkg" != python3 ] || pkg=python; pacman -S --needed --noconfirm "$pkg" || return 1; done
+  else warn "找不到支持的包管理器，请安装: ${missing[*]}"; return 1; fi
+}
+
+cmd_return_recover(){
+  need_root
+  take_lock recovery
+  [ -f "$STATE_DIR/return-pending.json" ] || { info "没有待恢复的回国任务"; return 0; }
+  return_assets || die "无法加载回国恢复模块"
+  local record
+  record=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["record_dir"])' "$STATE_DIR/return-pending.json") || die "恢复记录无法读取"
+  python3 "$RETURN_HELPER" recover --record-dir "$record" --lock-fd 9 || return 1
+  ok "回国任务的参数恢复和临时资源清理已完成"
+}
+
+cmd_return(){
+  local server="" server_bw="" client_bw="" control_port=5211 iperf_port=5212 role=proxy yes=0 ttl=600
+  local ports_given=0 args=() choice
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --server|--server-bw|--client-bw|--control-port|--iperf-port|--role|--token-ttl)
+        [ $# -ge 2 ] || die "$1 缺少参数"
+        case "$1" in
+          --server) server="$2" ;; --server-bw) server_bw="$2" ;; --client-bw) client_bw="$2" ;;
+          --control-port) control_port="$2"; ports_given=1 ;; --iperf-port) iperf_port="$2"; ports_given=1 ;;
+          --role) role="$2" ;; --token-ttl) ttl="$2" ;;
+        esac
+        shift 2 ;;
+      -4|-6) IP_FAMILY="$1"; shift ;;
+      -y|--yes) yes=1; shift ;;
+      -h|--help)
+        printf '%s\n' '用法: tcpfit return [--server 可达地址] [--server-bw Mbps] [--client-bw Mbps]' \
+          '       [--control-port 5211] [--iperf-port 5212] [--role proxy|bulk|mixed] [-4|-6] [--yes]' \
+          '       [--token-ttl 600]（30-1800 秒，配对成功即失效）' \
+          '带宽可留空。接入后自动测速和调优，只修改本服务器；家宽无需公网 IP。'
+        return 0 ;;
+      *) die "未知回国调优参数: $1" ;;
+    esac
+  done
+  need_root
+  [ ! -f /etc/openwrt_release ] || die "OpenWrt / iStoreOS 本次仅支持测速端，请执行调优服务器生成的接入命令"
+  take_lock
+  if [ "$yes" = 0 ]; then
+    echo; step "回国调优"
+    echo "    家宽主动连接，服务器发送测试数据；接入后自动执行。"
+    echo "    将保存当前配置，验证基础调优；已有整形只可能保持或验证后提高。"
+    echo "    需要 python3、iperf3、openssl、curl 和 iptables，缺少时自动安装。"
+    [ -n "$server" ] || server=$(ask "  家宽可访问的服务器地址（IP 或域名）" "")
+    [ -n "$server_bw" ] || server_bw=$(ask "  服务器标称出口 Mbps（已知建议填，回车留空）" "")
+    [ -n "$client_bw" ] || client_bw=$(ask "  家宽标称下载 Mbps（已知建议填，回车留空）" "")
+    if [ "$ports_given" = 0 ]; then
+      control_port=$(ask "  接入端口 TCP" 5211)
+      iperf_port=$(ask "  测速端口 TCP" 5212)
+    fi
+    choice=$(ask "  用途 1) 代理/加速  2) 大文件  3) 混合" 1)
+    case "$choice" in 1) role=proxy ;; 2) role=bulk ;; 3) role=mixed ;; *) die "用途必须为 1、2 或 3" ;; esac
+  fi
+  [ -n "$server" ] || die "缺少服务器可达地址，请使用 --server 或通过菜单填写"
+  is_posint "$control_port" 1024 65535 || die "接入端口必须是 1024-65535 的整数"
+  is_posint "$iperf_port" 1024 65535 || die "测速端口必须是 1024-65535 的整数"
+  [ "$control_port" != "$iperf_port" ] || die "接入端口和测速端口不能相同"
+  is_posint "$ttl" 30 1800 || die "token 有效期必须是 30-1800 秒"
+  [ -z "$server_bw" ] || is_posint "$server_bw" 1 1000000 || die "服务器标称带宽必须是 1-1000000 Mbps 的整数"
+  [ -z "$client_bw" ] || is_posint "$client_bw" 1 1000000 || die "家宽标称带宽必须是 1-1000000 Mbps 的整数"
+  case "$role" in proxy|bulk|mixed) ;; *) die "用途必须是 proxy / bulk / mixed" ;; esac
+  echo
+  _conf "服务器地址" "$server（IPv${IP_FAMILY#-}）"
+  _conf "接入 / 测速端口" "$control_port / $iperf_port TCP"
+  _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
+  _conf "测试方式" "单连接和四连接反向下载，约 6-10 分钟"
+  _conf "带宽含义" "实测是当前路径可用带宽，标称值仅作能力参考"
+  if [ "$yes" = 0 ]; then confirm "  开始并等待家宽接入？" y || { info "已取消"; return 0; }; fi
+  return_dependencies || die "依赖准备失败，未开始测速"
+  return_assets || die "回国模块准备失败，请使用完整项目或 install.sh 安装同版本文件"
+  args=(run --script "$RETURN_MAIN" --client-script "$RETURN_CLIENT" --server "$server"
+    --control-port "$control_port" --iperf-port "$iperf_port" --family "${IP_FAMILY#-}"
+    --role "$role" --token-ttl "$ttl" --state-dir "$STATE_DIR" --lock-fd 9)
+  [ -z "$server_bw" ] || args+=(--server-bw "$server_bw")
+  [ -z "$client_bw" ] || args+=(--client-bw "$client_bw")
+  python3 "$RETURN_HELPER" "${args[@]}" &
+  local pid=$! rc=0
+  trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 130' INT TERM HUP
+  wait "$pid" || rc=$?
+  trap - INT TERM HUP
+  return "$rc"
 }
 
 # ── 交互式菜单 ──────────────────────────────────────────────────────────────
@@ -3002,12 +3152,13 @@ banner(){
   _top
   _row "$(printf '  tcpfit - VPS TCP Optimization%s ' "$(_rpad "v$VERSION" 23)")" '0;32'
   _row "  本脚本由 kylin010 编写和维护"
-  _row "  github.com/Kylin010/tcpfit"
+  _row "  上游 Kylin010/tcpfit；本分支 P0me1oo/tcpfit-x"
   _row "  VPS 补货频道  t.me/vpskuaibu"
   _row "  VPS 测评数据  spacevps.cc"
   _sep
   _row "  0. Exit"
   _item 1 "一键调优" "Auto-tune (recommended)"   "~10 min"
+  _item r "回国调优" "Return-path tuning"        "~6-10 min"
   _item 2 "基础调优" "Base tuning only"          "~1 min"
   _item 3 "拐点测试" "Policer sweep"             "~8 min"
   _item 4 "加 swap"  "Add swap (low-memory box)"
@@ -3030,6 +3181,9 @@ banner(){
 # 设计原则：所有要用户回答的东西集中在最前面（3 个问题）, 确认之后一路跑到底不再打断；
 # 执行阶段的日志用英文（都是参数名和数值, 中英混排反而看不清）, 结论用中文.
 wizard(){
+  need_root
+  take_lock
+  migrate_legacy
   local WIZARD=1 ARCH_INCLUDE_SWEEP=0
   local ARCH_ROLE="" ARCH_BW="" ARCH_RTT="" ARCH_PEER=""
   local ram; ram=$(detect_ram_mb)
@@ -3504,15 +3658,15 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
 menu_loop(){
   need_root
   take_lock
-  migrate_legacy
   self_install
   telemetry_ping
   while true; do
     banner
     echo
-    local c; c=$(ask "  请选择 / Select [0-9,u]" "1")
+    local c; c=$(ask "  请选择 / Select [0-9,r,u]" "1")
     echo
     case "$c" in
+      r|R) cmd_return; local rc=$?; drain_tty; exit "$rc" ;;
       1) wizard
          # 跑完直接退出, 不回菜单. 回菜单要经过 banner 的 clear, 而 clear 发的是
          # \033[H\033[2J\033[3J —— 那个 3J 连滚动回滚缓冲一起清掉, 往上翻也找不回
@@ -3576,7 +3730,11 @@ menu_loop(){
 # ── 入口 ────────────────────────────────────────────────────────────────────
 usage(){ awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
 
+# 支持回国协调进程加载同一份函数，以及隔离测试加载公共计算方法。
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "${1:-}" in
+  return|return-tune) shift; cmd_return "$@" ;;
+  return-recover) shift; cmd_return_recover "$@" ;;
   detect)   shift; cmd_detect "$@" ;;
   tune)     shift; cmd_tune "$@" ;;
   probe)    shift; cmd_probe "$@" ;;
@@ -3595,3 +3753,4 @@ case "${1:-}" in
   -h|--help|help) usage ;;
   *) die "未知命令: $1（-h 看用法）" ;;
 esac
+fi

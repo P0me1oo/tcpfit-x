@@ -4,16 +4,16 @@
 # 两种用法：
 #
 #   1) 在目标 VPS 上直接跑（只装 agent, 单机调优）
-#      curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/install.sh | bash
+#      curl -fsSL https://raw.githubusercontent.com/P0me1oo/tcpfit-x/main/install.sh | bash
 #      然后: tcpfit detect
 #
 #   2) 在控制端跑（装完整项目, 管理多台机器 —— 未上线, 尚未在真实环境验证）
-#      curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/install.sh | bash -s -- --full
+#      curl -fsSL https://raw.githubusercontent.com/P0me1oo/tcpfit-x/main/install.sh | bash -s -- --full
 #      然后: cd /opt/tcpfit && python3 orchestrator/fleet.py detect
 
 set -euo pipefail
 
-REPO="Kylin010/tcpfit"
+REPO="P0me1oo/tcpfit-x"
 RAW="https://raw.githubusercontent.com/$REPO/main"
 PREFIX="${PREFIX:-/usr/local/bin}"
 PROJECT_DIR="${PROJECT_DIR:-/opt/tcpfit}"
@@ -39,9 +39,24 @@ command -v curl >/dev/null || die "需要 curl"
 
 if [ "$MODE" = agent ]; then
   say "安装 agent 到 $PREFIX"
-  curl -fsSL "$RAW/tcpfit.sh" -o "$PREFIX/tcpfit" \
-    || die "下载失败, 检查网络或 GitHub 可达性"
-  chmod +x "$PREFIX/tcpfit"
+  command -v sha256sum >/dev/null || die "需要 sha256sum 校验安装文件"
+  dl=$(mktemp -d)
+  trap 'rm -rf "$dl"' EXIT
+  curl -fsSL --max-time 30 "$RAW/SHA256SUMS" -o "$dl/SHA256SUMS" || die "下载校验清单失败"
+  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+    curl -fsSL --max-time 60 "$RAW/$f" -o "$dl/$f" || die "下载 $f 失败"
+    (cd "$dl" && grep -F "  $f" SHA256SUMS | sha256sum -c - >/dev/null 2>&1) || die "$f 校验失败，未安装"
+  done
+  version=$(sed -n 's/^VERSION="\([0-9][0-9.]*\)"$/\1/p' "$dl/tcpfit.sh")
+  [ -n "$version" ] || die "无法读取版本号"
+  lib_dir="/usr/local/lib/tcpfit/$version"
+  mkdir -p "$PREFIX" "$lib_dir"
+  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+    install -m 755 "$dl/$f" "$lib_dir/$f.new"
+    mv -f "$lib_dir/$f.new" "$lib_dir/$f"
+  done
+  install -m 755 "$dl/tcpfit.sh" "$PREFIX/tcpfit.new"
+  mv -f "$PREFIX/tcpfit.new" "$PREFIX/tcpfit"
   rm -f /usr/local/sbin/tcpfit.sh          # 清掉 v0.3.1 及更早的安装位置
   ok "已安装: $PREFIX/tcpfit"
 
@@ -59,6 +74,7 @@ if [ "$MODE" = agent ]; then
   echo
   echo "下一步："
   echo "    tcpfit detect                       # 看机器画像"
+  echo "    tcpfit return                       # 家宽主动接入的回国调优"
   echo "    tcpfit tune --role proxy --bw 500   # 基础调优"
   echo "    tcpfit sweep --peer <近处iperf3服务器> --nominal 500"
   echo "    tcpfit shape --rate <sweep给的推荐值>"
