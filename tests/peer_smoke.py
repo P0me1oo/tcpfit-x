@@ -38,8 +38,8 @@ def main():
             signal.signal(sig, cancel)
         try:
             firewall.setup()
-            pin = MODULE.start_http(coordinator)
-            print(MODULE.join_command(args, coordinator.token, pin), flush=True)
+            MODULE.start_http(coordinator)
+            print(MODULE.join_command(args, coordinator.token), flush=True)
             while not coordinator.paired.wait(0.5):
                 coordinator.check()
             for streams in (1, 4):

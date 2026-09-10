@@ -1,7 +1,7 @@
 #!/bin/sh
 # tcpfit 回国测速端：兼容常规 Linux、OpenWrt、iStoreOS 的 /bin/sh。
 # 本脚本只安装缺少的工具、主动连接和回报测量；不修改网络参数或启动入站服务。
-TCPFIT_CLIENT_VERSION="0.6.0"
+TCPFIT_CLIENT_VERSION="0.7.0"
 set -u
 umask 077
 
@@ -71,20 +71,20 @@ prepare(){
   [ "$(id -u)" = 0 ] || abort "需要安装$missing，请以 root 执行接入命令"
   printf '[*] 安装测速工具:%s\n' "$missing"
   if command -v opkg >/dev/null 2>&1; then
-    opkg update && opkg install $missing ca-bundle || abort "opkg 安装失败，尚未配对"
+    opkg update && opkg install $missing || abort "opkg 安装失败，尚未配对"
   elif command -v apk >/dev/null 2>&1; then
-    apk add $missing ca-certificates || abort "apk 安装失败，尚未配对"
+    apk add $missing || abort "apk 安装失败，尚未配对"
   elif command -v apt-get >/dev/null 2>&1; then
     if command -v debconf-set-selections >/dev/null 2>&1; then
       printf 'iperf3 iperf3/start_daemon boolean false\n' | debconf-set-selections
     fi
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y $missing ca-certificates || abort "apt 安装失败，尚未配对"
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing || abort "apt 安装失败，尚未配对"
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y $missing ca-certificates || abort "dnf 安装失败，尚未配对"
+    dnf install -y $missing || abort "dnf 安装失败，尚未配对"
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y $missing ca-certificates || abort "yum 安装失败，尚未配对"
+    yum install -y $missing || abort "yum 安装失败，尚未配对"
   elif command -v pacman >/dev/null 2>&1; then
-    pacman -S --needed --noconfirm $missing ca-certificates || abort "pacman 安装失败，尚未配对"
+    pacman -S --needed --noconfirm $missing || abort "pacman 安装失败，尚未配对"
   else
     abort "无法自动安装，请先安装$missing 后重新执行接入命令"
   fi
@@ -156,20 +156,17 @@ run_test(){
 main(){
   if [ "${1:-}" = --help ] || [ $# = 0 ]; then
     printf '%s\n' '这是回国测速端脚本。请执行调优端生成的完整接入命令。' \
-      '用法: sh tcpfit-client.sh 服务器IP 接入端口 测速端口 临时token 证书公钥指纹'
+      '用法: sh tcpfit-client.sh 服务器IP 接入端口 测速端口 临时token'
     return 0
   fi
-  [ $# = 5 ] || abort "接入参数不完整，请重新复制调优端的命令"
-  server="$1"; control_port="$2"; iperf_port="$3"; token="$4"; pin="$5"
+  [ $# = 4 ] || abort "接入参数不完整，请重新复制调优端的命令"
+  server="$1"; control_port="$2"; iperf_port="$3"; token="$4"
   case "$server" in ''|*[!a-fA-F0-9.:]*) abort "接入地址必须是调优端生成的 IP 地址" ;; esac
   case "$control_port:$iperf_port" in *[!0-9:]*|:*) abort "端口格式无效" ;; esac
   [ "$control_port" -ge 1024 ] && [ "$control_port" -le 65535 ] && [ "$iperf_port" -ge 1024 ] && [ "$iperf_port" -le 65535 ] || abort "端口超出范围"
   case "$token" in ''|*[!a-zA-Z0-9_-]*) abort "临时 token 格式无效" ;; esac
   [ "${#token}" = 32 ] || abort "临时 token 长度无效"
-  case "$pin" in sha256//*) ;; *) abort "缺少服务器证书公钥指纹" ;; esac
-  case "${pin#sha256//}" in *[!a-zA-Z0-9+/=]*) abort "服务器指纹格式无效" ;; esac
-  [ "${#pin}" = 52 ] || abort "服务器指纹长度无效"
-  case "$server" in *:*) family=-6; base="https://[$server]:$control_port" ;; *) family=-4; base="https://$server:$control_port" ;; esac
+  case "$server" in *:*) family=-6; base="http://[$server]:$control_port" ;; *) family=-4; base="http://$server:$control_port" ;; esac
   lock_dir="${TMPDIR:-/tmp}/tcpfit-client-$(id -u).lock"
   mkdir "$lock_dir" 2>/dev/null || abort "本机已有测速端任务或未清理的任务锁：$lock_dir；不会抢占现有任务"
   own_lock=1
@@ -179,8 +176,7 @@ main(){
   start_guard
   prepare
   {
-    printf '%s\n' 'silent' 'show-error' 'insecure' 'noproxy = "*"' 'connect-timeout = 5' 'max-time = 20'
-    printf 'pinnedpubkey = "%s"\n' "$pin"
+    printf '%s\n' 'silent' 'show-error' 'noproxy = "*"' 'connect-timeout = 5' 'max-time = 20'
     printf 'header = "X-Tcpfit-Version: %s"\n' "$TCPFIT_CLIENT_VERSION"
     printf 'header = "Authorization: Pair %s"\n' "$token"
   } > "$cfg"

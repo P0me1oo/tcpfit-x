@@ -4,7 +4,6 @@
 import argparse
 import base64
 from contextlib import contextmanager
-import hashlib
 import hmac
 import http.server
 import ipaddress
@@ -19,7 +18,6 @@ import shutil
 import signal
 import socket
 import socketserver
-import ssl
 import statistics
 import subprocess
 import sys
@@ -27,7 +25,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 MAX_BODY = 2 * 1024 * 1024
 HEARTBEAT_TIMEOUT = 45
 TASK_TIMEOUT = 1800
@@ -72,6 +70,7 @@ def command(args, check=True, input_data=None):
             [str(arg) for arg in args], input=input_data,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
             universal_newlines=True, encoding="utf-8", errors="replace",
+            env=dict(os.environ, LC_ALL="C"),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise TaskError("命令无法完成: {}: {}".format(args[0], error))
@@ -595,7 +594,42 @@ class Firewall:
             "binary": "iptables" if family == 4 else "ip6tables", "family": family,
             "chain": "TFRET_" + task_id[:12], "control": control_port, "iperf": iperf_port,
             "tag": "tcpfit-return:" + task_id, "created": False, "native_chains": [],
+            "table": "tcpfit_return_" + task_id, "backend": "none", "manager": None,
         }
+
+    @staticmethod
+    def select(family):
+        binary = "iptables" if family == 4 else "ip6tables"
+        available = shutil.which(binary)
+        native = shutil.which("nft")
+        if shutil.which("ufw"):
+            status = command(["ufw", "status"], check=False)
+            if status.returncode:
+                raise TaskError("已有 UFW 状态读取失败: " + status.stderr.strip())
+            if re.search(r"^Status: active\s*$", status.stdout, re.MULTILINE):
+                # UFW 使用现有内核防火墙；临时链放在其分发规则之前，不改 UFW 配置。
+                if available:
+                    return {"backend": "iptables", "binary": binary, "manager": "ufw"}
+                if native:
+                    return {"backend": "nft", "manager": "ufw"}
+                raise TaskError("UFW 已启用，但找不到可用的底层防火墙工具；本程序不安装这些工具")
+        if native:
+            # 已有 legacy 规则无法通过 nft 查看；继续用原工具并兼容原生 nft 链。
+            if available and "nf_tables" not in command([binary, "--version"]).stdout:
+                rules = command([binary, "-S"]).stdout
+                if any(line.startswith("-A ") or re.match(r"-P \S+ (DROP|REJECT)$", line) for line in rules.splitlines()):
+                    return {"backend": "iptables", "binary": binary, "manager": None}
+            return {"backend": "nft", "manager": None}
+        if available:
+            return {"backend": "iptables", "binary": binary, "manager": None}
+        return {"backend": "none", "manager": None}
+
+    def description(self):
+        backend = self.state["backend"]
+        if backend == "none":
+            return "无可用防火墙工具，跳过测速端口的来源 IP 限制，不安装工具"
+        tool = "nftables" if backend == "nft" else self.state["binary"]
+        return "UFW（复用现有 {} 添加临时规则）".format(tool) if self.state["manager"] == "ufw" else tool + "（临时规则）"
 
     def save(self):
         atomic_json(self.path, self.state)
@@ -608,7 +642,15 @@ class Firewall:
         if not shutil.which("nft"):
             return []
         result = command(["nft", "-j", "list", "ruleset"], check=False)
-        return json.loads(result.stdout).get("nftables", []) if result.returncode == 0 else []
+        if result.returncode:
+            raise TaskError("已有 nftables 规则读取失败: " + result.stderr.strip())
+        try:
+            rules = json.loads(result.stdout)["nftables"]
+            if not isinstance(rules, list):
+                raise ValueError("规则列表无效")
+            return rules
+        except (ValueError, KeyError, TypeError) as error:
+            raise TaskError("无法解析已有 nftables 规则: " + str(error))
 
     def native_allow(self, peer=None):
         # 某些主机同时使用 iptables 和原生 nft input 链；后者的 drop 策略仍会生效。
@@ -617,26 +659,51 @@ class Firewall:
         proto = "ip" if family == 4 else "ip6"
         port = self.state["iperf"] if peer else self.state["control"]
         tag = self.state["tag"] + (":peer" if peer else ":control")
+        expressions = []
+        if peer:
+            expressions.append({"match": {"op": "==", "left": {"payload": {"protocol": proto, "field": "saddr"}}, "right": peer}})
+        expressions.extend([{"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": port}},
+                            {"counter": None}, {"accept": None}])
         for chain in self.state["native_chains"]:
-            prefix = "insert rule {} {} {} ".format(chain["family"], json.dumps(chain["table"]), json.dumps(chain["name"]))
-            match = "meta nfproto {} ".format("ipv4" if family == 4 else "ipv6")
-            if peer:
-                match += "{} saddr {} ".format(proto, peer)
-            rule = prefix + match + "tcp dport {} counter accept comment {}\n".format(port, json.dumps(tag))
-            command(["nft", "-f", "-"], input_data=rule)
+            # ip/ip6 表已经限定协议族，只有 inet 表接受 nfproto 条件。
+            family_match = [{"match": {"op": "==", "left": {"meta": {"key": "nfproto"}},
+                                        "right": "ipv4" if family == 4 else "ipv6"}}] if chain["family"] == "inet" else []
+            rule = {"family": chain["family"], "table": chain["table"], "chain": chain["name"],
+                    "expr": family_match + expressions, "comment": tag}
+            # JSON 接口直接传递已有名称，避免把表名、链名当成 nft 脚本语法。
+            command(["nft", "-j", "-f", "-"], input_data=json.dumps({"nftables": [{"insert": {"rule": rule}}]}))
 
     def setup(self):
+        self.state.update(self.select(self.state["family"]))
         self.save()
+        log("端口规则: " + self.description())
+        if self.state["backend"] == "none":
+            return
         binary = self.state["binary"]
-        nft_backend = "nf_tables" in command([binary, "--version"]).stdout
-        for entry in self.nft_rules():
+        iptables_nft = self.state["backend"] == "iptables" and "nf_tables" in command([binary, "--version"]).stdout
+        rules = self.nft_rules()
+        for entry in rules:
             chain = entry.get("chain", {})
             if chain.get("hook") != "input" or chain.get("family") not in ("inet", "ip" if self.state["family"] == 4 else "ip6"):
                 continue
-            if nft_backend and chain.get("table") == "filter" and chain.get("name") == "INPUT" and chain.get("family") != "inet":
+            if iptables_nft and chain.get("table") == "filter" and chain.get("name") == "INPUT" and chain.get("family") != "inet":
                 continue
             self.state["native_chains"].append(chain)
         self.save()
+        if self.state["backend"] == "nft":
+            table = self.state["table"]
+            if any(row.get("table", {}).get("family") == "inet" and row["table"].get("name") == table for row in rules):
+                raise TaskError("临时 nftables 表名称已存在，未更改现有表")
+            self.state["created"] = True
+            self.save()
+            # 独立表只拦截本次测速端口；其他流量继续经过原有规则。
+            command(["nft", "-f", "-"], input_data=(
+                "add table inet {table}\n"
+                "add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}\n"
+                "add rule inet {table} input meta nfproto ipv{family} tcp dport {port} drop\n"
+            ).format(table=table, family=self.state["family"], port=self.state["iperf"]))
+            self.native_allow()
+            return
         chain = self.state["chain"]
         if self.iptables("-S", chain, check=False).returncode == 0:
             raise TaskError("临时防火墙链名称已存在，未更改现有链")
@@ -650,8 +717,14 @@ class Firewall:
 
     def pair(self, peer):
         peer = str(ipaddress.ip_address(peer))
-        self.iptables("-I", self.state["chain"], "1", "-s", peer, "-p", "tcp", "--dport", str(self.state["iperf"]), "-j", "ACCEPT")
-        self.native_allow(peer)
+        if self.state["backend"] == "nft":
+            command(["nft", "-f", "-"], input_data=(
+                "insert rule inet {} input {} saddr {} tcp dport {} accept\n".format(
+                    self.state["table"], "ip" if self.state["family"] == 4 else "ip6", peer, self.state["iperf"])))
+        elif self.state["backend"] == "iptables":
+            self.iptables("-I", self.state["chain"], "1", "-s", peer, "-p", "tcp", "--dport", str(self.state["iperf"]), "-j", "ACCEPT")
+        if self.state["backend"] != "none":
+            self.native_allow(peer)
         self.state["peer"] = peer
         self.save()
 
@@ -661,16 +734,29 @@ class Firewall:
         if not path.exists():
             return
         state = read_json(path)
+        # 旧版恢复记录没有 backend 字段，仍按原来的 iptables 规则清理。
+        backend = state.get("backend", "iptables")
+        if backend == "none":
+            path.unlink()
+            return
         failures = []
-        for entry in cls.nft_rules():
+        rules = cls.nft_rules()
+        for entry in rules:
             rule = entry.get("rule", {})
             if rule.get("comment") not in (state["tag"] + ":peer", state["tag"] + ":control"):
                 continue
             try:
-                command(["nft", "delete", "rule", rule["family"], rule["table"], rule["chain"], "handle", str(rule["handle"])])
+                identity = {key: rule[key] for key in ("family", "table", "chain", "handle")}
+                command(["nft", "-j", "-f", "-"], input_data=json.dumps({"nftables": [{"delete": {"rule": identity}}]}))
             except TaskError as error:
                 failures.append(str(error))
-        if state["created"]:
+        if state["created"] and backend == "nft":
+            try:
+                if any(row.get("table", {}).get("family") == "inet" and row["table"].get("name") == state["table"] for row in rules):
+                    command(["nft", "delete", "table", "inet", state["table"]])
+            except TaskError as error:
+                failures.append(str(error))
+        elif state["created"]:
             prefix = [state["binary"], "-w", "5"]
             jump = ["INPUT", "-p", "tcp", "-m", "multiport", "--dports", "{},{}".format(state["control"], state["iperf"]), "-j", state["chain"]]
             try:
@@ -684,20 +770,6 @@ class Firewall:
         if failures:
             raise TaskError("临时端口规则清理失败: " + "; ".join(failures))
         path.unlink()
-
-
-def create_certificate(run_dir):
-    cert, key = Path(run_dir) / "server.crt", Path(run_dir) / "server.key"
-    command(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=tcpfit-return", "-keyout", str(key), "-out", str(cert)])
-    os.chmod(str(key), 0o600)
-    public = command(["openssl", "x509", "-in", str(cert), "-pubkey", "-noout"]).stdout
-    der = subprocess.run(["openssl", "pkey", "-pubin", "-outform", "DER"], input=public.encode("ascii"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
-    pin = "sha256//" + base64.b64encode(hashlib.sha256(der).digest()).decode("ascii")
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    if hasattr(ssl, "TLSVersion"):
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(str(cert), str(key))
-    return context, pin
 
 
 def clean_raw(document):
@@ -941,7 +1013,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 coordinator.fail(str(error))
             try:
                 self.reply(400, str(error))
-            except (OSError, ssl.SSLError):
+            except OSError:
                 pass
 
     def do_GET(self):
@@ -951,7 +1023,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.handle_request(True)
 
 
-class TLSServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+class ControlServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
@@ -963,22 +1035,19 @@ class TLSServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     def process_request_thread(self, request, address):
         try:
             request.settimeout(15)
-            request = self.context.wrap_socket(request, server_side=True)
             super().process_request_thread(request, address)
-        except (OSError, ssl.SSLError):
+        except OSError:
             request.close()
 
 
 def start_http(coordinator):
-    context, pin = create_certificate(coordinator.run_dir)
     family = socket.AF_INET if coordinator.args.family == 4 else socket.AF_INET6
-    class Server(TLSServer):
+    class Server(ControlServer):
         address_family = family
     server = Server(("0.0.0.0" if family == socket.AF_INET else "::", coordinator.args.control_port), Handler)
-    server.coordinator, server.context = coordinator, context
+    server.coordinator = coordinator
     coordinator.httpd = server
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return pin
 
 
 def request_measurement(args):
@@ -1069,7 +1138,7 @@ def clear_pending(journal):
 
 
 def remove_credentials(run_dir):
-    """恢复参数失败时也撤销 TLS 凭据；恢复所需信息保存在私有持久目录中。"""
+    """兼容旧版本恢复记录，清理旧任务可能留下的临时证书。"""
     for name in ("server.key", "server.crt"):
         path = Path(run_dir) / name
         try:
@@ -1131,14 +1200,13 @@ def guard(record_dir):
     recover(record_dir)
 
 
-def join_command(args, token, pin):
+def join_command(args, token):
     host = "[{}]".format(args.server) if args.family == 6 else args.server
-    direct = "https://{}:{}/join.sh".format(host, args.control_port)
-    fallback = "https://raw.githubusercontent.com/P0me1oo/tcpfit-x/v{}/tcpfit-client.sh".format(VERSION)
-    values = [args.server, str(args.control_port), str(args.iperf_port), token, pin]
-    # 默认由服务器提供同版本脚本；只有 wget 的最小系统从版本化地址引导，再安装 curl。
-    return "(curl -fkSs --noproxy '*' --pinnedpubkey {} {} || wget -qO- {}) | sh -s -- {}".format(
-        shlex.quote(pin), shlex.quote(direct), shlex.quote(fallback), " ".join(shlex.quote(value) for value in values))
+    direct = shlex.quote("http://{}:{}/join.sh".format(host, args.control_port))
+    values = [args.server, str(args.control_port), str(args.iperf_port), token]
+    # 两种下载工具都直接获取调优端提供的同版本脚本，无需发布标签或证书。
+    return "(curl -fsS --noproxy '*' {} || wget -qO- {}) | sh -s -- {}".format(
+        direct, direct, " ".join(shlex.quote(value) for value in values))
 
 
 def validate_environment(args):
@@ -1146,7 +1214,7 @@ def validate_environment(args):
         raise TaskError("调优端需要常规 Linux 的 root 权限")
     if Path("/etc/openwrt_release").exists():
         raise TaskError("OpenWrt / iStoreOS 本次仅支持测速端角色")
-    for binary in ("bash", "iperf3", "openssl", "ip", "tc", "ss", "sysctl", "systemctl", "iptables" if args.family == 4 else "ip6tables"):
+    for binary in ("bash", "iperf3", "ip", "tc", "ss", "sysctl", "systemctl"):
         if not shutil.which(binary):
             raise TaskError("缺少依赖: " + binary)
     if args.control_port == args.iperf_port or any(port < 1024 or port > 65535 for port in (args.control_port, args.iperf_port)):
@@ -1253,8 +1321,10 @@ def run_locked_task(args):
         # 配对之前先确认队列可恢复，避免让家宽接入后才发现不支持。
         QueueState.capture(iface)
         firewall.setup()
-        pin = start_http(coordinator)
-        print("\n在测速端复制执行下面这一条命令：\n\n{}\n".format(join_command(args, coordinator.token, pin)), flush=True)
+        result["firewall"] = {"backend": firewall.state["backend"], "manager": firewall.state["manager"],
+                              "source_ip_restricted": firewall.state["backend"] != "none"}
+        start_http(coordinator)
+        print("\n在测速端复制执行下面这一条命令：\n\n{}\n".format(join_command(args, coordinator.token)), flush=True)
         log("token {} 秒内有效，只能配对一次。接入后无需返回调优端操作。".format(args.token_ttl))
         while not coordinator.paired.wait(0.5):
             coordinator.check()

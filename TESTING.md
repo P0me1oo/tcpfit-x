@@ -11,14 +11,14 @@ bash -n install.sh
 sh -n tcpfit-client.sh
 ```
 
-常规回归检查真实结果解析、错误与不完整数据拒绝、一次性配对、来源绑定、心跳中断、原版重传阈值、整形提高条件和路由恢复。Linux 集成测试默认跳过，不会在普通开发机上修改网络。
+常规回归检查真实结果解析、错误与不完整数据拒绝、HTTP 接入、一次性配对、来源绑定、心跳中断、防火墙选择、原版重传阈值、整形提高条件和路由恢复。依赖测试使用替代包管理器检查实际安装请求，不执行软件安装。Linux 集成测试默认跳过，不会在普通开发机上修改网络。
 
 ## Linux 隔离集成
 
-需要 Linux root、Python 3、Bash、iproute2、iptables、util-linux。必须在独立网络命名空间中运行；测试会主动拒绝主机初始网络命名空间。
+需要 Linux root、Python 3、Bash、iproute2、util-linux、curl、wget 和 iperf3。完整防火墙验证还需要系统已有的 iptables/ip6tables、nftables 和 UFW；缺少对应工具的用例会跳过，测试不安装软件。必须在独立网络命名空间中运行；UFW 共存用例还需要独立挂载命名空间。
 
 ```bash
-sudo env TCPFIT_LINUX_INTEGRATION=1 unshare --net \
+sudo env TCPFIT_LINUX_INTEGRATION=1 unshare --mount --net \
   python3 -m unittest discover -s tests -v
 ```
 
@@ -26,8 +26,12 @@ sudo env TCPFIT_LINUX_INTEGRATION=1 unshare --net \
 
 - 单层 HTB + fq、定制 fq、fq_codel、mq 各叶子的保存和恢复。
 - 只有已配对来源可以访问测试端口，删除临时规则后不残留任务链。
+- 分别验证 nftables、iptables/ip6tables 的 IPv4 和 IPv6 来源限制，保留已有的拒绝规则。
+- UFW 启用时复用其现有底层工具，重载后仍限制测速来源，退出后保留原配置。UFW 的启用、重载和关闭只在隔离网络与配置副本中执行。
+- 无防火墙工具时，真实 iperf3 客户端完成单连接、四连接反向测速和结果回报；流量仅在隔离环境的本地回环中传输。
+- 只有 curl 或只有 wget 时，均可通过 HTTP 下载接入脚本并正确传递四个参数。
 - 原版入口与手动恢复遵守相同任务锁。
-- 协调进程被 SIGKILL 后，守护进程恢复队列、清理凭据与待恢复标记。
+- 协调进程被 SIGKILL 后，守护进程恢复队列、清理端口规则、凭据与待恢复标记。
 - 测速端被 SIGKILL 后，独立清理进程撤销本地凭据和任务锁，并报告异常退出。
 - IPv6 路由到期倒计时变化不触发无意义回写；确需回写时使用 iproute2 接受的有效期格式。
 
@@ -61,4 +65,4 @@ sha256sum tcpfit.sh install.sh tcpfit-return.py tcpfit-client.sh > SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
-发布 `v<版本号>` 标签时，Release 附件应包含这四个运行文件和 `SHA256SUMS`。更新命令从 Release 下载，测速端 wget 回退从同一版本标签下载；缺文件或校验失败会停止安装或更新。
+发布 `v<版本号>` 标签时，Release 附件应包含这四个运行文件和 `SHA256SUMS`。更新命令从 Release 下载；缺文件或校验失败会停止安装或更新。测速端从当前调优服务器获取脚本，不依赖 Release 下载。

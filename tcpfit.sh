@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tcpfit — 单机 TCP 调优代理
 #
-# 原版调优使用 bash；回国双端模式另需 Python 3、curl、openssl 和 iperf3。
+# 原版调优使用 bash；回国双端模式另需 Python 3、curl 和 iperf3。
 # 所有"该设多少"的判断都由实测或机器规格推导, 不使用抄来的固定值.
 #
 # 用法:
@@ -33,7 +33,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -2789,15 +2789,14 @@ return_assets(){
 
 return_dependencies(){
   local c pkg missing=()
-  for c in python3 iperf3 openssl curl iptables; do
+  for c in python3 iperf3 curl; do
     command -v "$c" >/dev/null || missing+=("$c")
   done
-  [ "$IP_FAMILY" != -6 ] || command -v ip6tables >/dev/null || missing+=(iptables)
   [ "${#missing[@]}" = 0 ] && return 0
   info "安装回国调优依赖: ${missing[*]}"
   if command -v apt-get >/dev/null; then
     command -v debconf-set-selections >/dev/null && printf 'iperf3 iperf3/start_daemon boolean false\n' | debconf-set-selections
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
   elif command -v dnf >/dev/null; then dnf install -y "${missing[@]}"
   elif command -v yum >/dev/null; then yum install -y "${missing[@]}"
   elif command -v apk >/dev/null; then apk add "${missing[@]}"
@@ -2848,7 +2847,8 @@ cmd_return(){
     echo; step "回国调优"
     echo "    家宽主动连接，服务器发送测试数据；接入后自动执行。"
     echo "    将保存当前配置，验证基础调优；已有整形只可能保持或验证后提高。"
-    echo "    需要 python3、iperf3、openssl、curl 和 iptables，缺少时自动安装。"
+    echo "    需要 python3、iperf3 和 curl，缺少时自动安装。"
+    echo "    接入使用 HTTP；防火墙只复用已有工具，不安装。"
     [ -n "$server" ] || server=$(ask "  家宽可访问的服务器地址（IP 或域名）" "")
     [ -n "$server_bw" ] || server_bw=$(ask "  服务器标称出口 Mbps（已知建议填，回车留空）" "")
     [ -n "$client_bw" ] || client_bw=$(ask "  家宽标称下载 Mbps（已知建议填，回车留空）" "")
@@ -2873,6 +2873,13 @@ cmd_return(){
   _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
   _conf "测试方式" "单连接和四连接反向下载，约 6-10 分钟"
   _conf "带宽含义" "实测是当前路径可用带宽，标称值仅作能力参考"
+  local firewall_binary=iptables
+  [ "$IP_FAMILY" != -6 ] || firewall_binary=ip6tables
+  if command -v ufw >/dev/null || command -v nft >/dev/null || command -v "$firewall_binary" >/dev/null; then
+    _conf "端口规则" "复用已有防火墙工具，不安装"
+  else
+    _conf "端口规则" "没有可用工具，测速端口不限制来源 IP"
+  fi
   if [ "$yes" = 0 ]; then confirm "  开始并等待家宽接入？" y || { info "已取消"; return 0; }; fi
   return_dependencies || die "依赖准备失败，未开始测速"
   return_assets || die "回国模块准备失败，请使用完整项目或 install.sh 安装同版本文件"

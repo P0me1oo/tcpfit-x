@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -75,6 +76,7 @@ class LinuxIntegrationTests(unittest.TestCase):
         MODULE.command(["tc", "qdisc", "replace", "dev", "tf-test0", "parent", "1:2", "handle", "12:", "fq_codel", "target", "8ms", "noecn"])
         self.check_roundtrip()
 
+    @unittest.skipUnless(shutil.which("iptables-save"), "缺少已有的 iptables 工具")
     def test_firewall_only_allows_paired_source_and_cleans_own_rules(self):
         with tempfile.TemporaryDirectory() as directory, socket.socket() as listener:
             listener.bind(("0.0.0.0", 0))
@@ -116,10 +118,10 @@ class LinuxIntegrationTests(unittest.TestCase):
             runtime.mkdir()
             args = types.SimpleNamespace(family=4, control_port=0, token_ttl=60, client_script=str(ROOT / "tcpfit-client.sh"))
             coordinator = MODULE.Coordinator(args, runtime, runtime, mock.Mock())
-            pin = MODULE.start_http(coordinator)
+            MODULE.start_http(coordinator)
             control_port = coordinator.httpd.server_address[1]
             env = dict(os.environ, TMPDIR=str(directory))
-            client = subprocess.Popen(["sh", str(ROOT / "tcpfit-client.sh"), "127.0.0.1", str(control_port), "45212", coordinator.token, pin], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            client = subprocess.Popen(["sh", str(ROOT / "tcpfit-client.sh"), "127.0.0.1", str(control_port), "45212", coordinator.token], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             try:
                 deadline = time.monotonic() + 10
                 while not coordinator.paired.is_set() and time.monotonic() < deadline:
@@ -169,7 +171,7 @@ class LinuxIntegrationTests(unittest.TestCase):
             systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             systemctl.chmod(0o700)
             fixture = directory / "owner.py"
-            fixture.write_text('''import importlib.util, os, pathlib, subprocess, sys, time
+            fixture.write_text('''import importlib.util, os, pathlib, secrets, subprocess, sys, time
 spec=importlib.util.spec_from_file_location("ret", sys.argv[1])
 m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 d=pathlib.Path(sys.argv[2]); run=d/"runtime"
@@ -181,6 +183,7 @@ with m.task_lock() as fd:
     m.atomic_json(d/"return-pending.json", {"record_dir":str(d)})
     out=open(d/"guard.log", "w")
     subprocess.Popen([sys.executable, sys.argv[1], "guard", "--record-dir", str(d)], stdout=out, stderr=subprocess.STDOUT, pass_fds=(fd,))
+    m.Firewall(d, 4, 45211, 45212, secrets.token_hex(8)).setup()
     m.command(["tc","qdisc","replace","dev","tf-test0","root","handle","7:","fq"])
     (run/"server.key").write_text("test-only-placeholder")
     (d/"ready").write_text("ready")
@@ -194,6 +197,7 @@ with m.task_lock() as fd:
                     self.assertIsNone(owner.poll())
                     time.sleep(0.1)
                 self.assertTrue((directory / "ready").exists())
+                firewall_state = MODULE.read_json(directory / "firewall.json")
                 owner.kill()
                 owner.wait(timeout=5)
                 deadline = time.monotonic() + 10
@@ -204,6 +208,9 @@ with m.task_lock() as fd:
                 self.assertTrue(journal["restored"])
                 self.assertFalse(run_dir.exists())
                 self.assertFalse((directory / "return-pending.json").exists())
+                self.assertFalse((directory / "firewall.json").exists())
+                if firewall_state["backend"] == "nft":
+                    self.assertFalse(any(entry.get("table", {}).get("name") == firewall_state["table"] for entry in MODULE.Firewall.nft_rules()))
                 self.assertEqual(self.normalized(MODULE.read_json(directory / "before.json")["queue"]), self.normalized(MODULE.QueueState.capture("tf-test0")))
             finally:
                 if owner.poll() is None:
