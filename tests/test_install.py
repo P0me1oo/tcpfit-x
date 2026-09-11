@@ -2,12 +2,14 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_VERSION = re.search(r'^VERSION="([0-9.]+)"$', (ROOT / "tcpfit.sh").read_text(encoding="utf-8"), re.MULTILINE).group(1)
 ENABLED = sys.platform.startswith("linux") and os.environ.get("TCPFIT_INSTALL_INTEGRATION") == "1"
 
 
@@ -46,7 +48,7 @@ else:
             def publish(version):
                 hashes = []
                 for name in ("tcpfit.sh", "install.sh", "tcpfit-return.py", "tcpfit-client.sh"):
-                    content = (ROOT / name).read_text(encoding="utf-8").replace("0.6.0", version).encode("utf-8")
+                    content = (ROOT / name).read_text(encoding="utf-8").replace(SOURCE_VERSION, version).encode("utf-8")
                     (fixture / name).write_bytes(content)
                     hashes.append(hashlib.sha256(content).hexdigest() + "  " + name)
                 (fixture / "SHA256SUMS").write_text("\n".join(hashes) + "\n", encoding="utf-8")

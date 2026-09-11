@@ -1,7 +1,7 @@
 #!/bin/sh
-# tcpfit 回国测速端：兼容常规 Linux、OpenWrt、iStoreOS 的 /bin/sh。
+# tcpfit 优化线路调优测速端：兼容常规 Linux、OpenWrt、iStoreOS 的 /bin/sh。
 # 本脚本只安装缺少的工具、主动连接和回报测量；不修改网络参数或启动入站服务。
-TCPFIT_CLIENT_VERSION="0.6.0"
+TCPFIT_CLIENT_VERSION="0.9.1"
 set -u
 umask 077
 
@@ -155,7 +155,7 @@ run_test(){
 
 main(){
   if [ "${1:-}" = --help ] || [ $# = 0 ]; then
-    printf '%s\n' '这是回国测速端脚本。请执行调优端生成的完整接入命令。' \
+    printf '%s\n' '这是优化线路调优测速端脚本。请执行调优端生成的完整接入命令。' \
       '用法: sh tcpfit-client.sh 服务器IP 接入端口 测速端口 临时token'
     return 0
   fi

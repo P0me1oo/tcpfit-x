@@ -1,4 +1,4 @@
-"""回国调优回归：配对隔离、真实数据校验、保留判据和恢复契约。"""
+"""优化线路调优回归：配对隔离、真实数据校验、保留判据和恢复契约。"""
 import copy
 import importlib.util
 from pathlib import Path
@@ -168,6 +168,32 @@ class DecisionTests(unittest.TestCase):
         after = self.rows([600] * 3, [900] * 3, 1.5)
         self.assertFalse(MODULE.base_decision(self.worker, before, after)[0])
 
+    def test_small_speed_noise_and_retrans_band_edge_do_not_reject_a_candidate(self):
+        before = self.rows([100] * 3, [200] * 3, 0.049)
+        after = self.rows([96, 97, 98], [193, 194, 195], 0.055)
+        self.assertTrue(MODULE.base_decision(self.worker, before, after)[0])
+        self.assertFalse(MODULE.retrans_acceptable(self.worker, before, after))
+
+    def test_speed_tolerance_is_bounded_for_each_stream_count(self):
+        before = self.rows([100] * 3, [200] * 3)
+        self.assertTrue(MODULE.base_decision(self.worker, before, self.rows([95] * 3, [190] * 3))[0])
+        self.assertFalse(MODULE.base_decision(self.worker, before, self.rows([94.9] * 3, [220] * 3))[0])
+        self.assertFalse(MODULE.base_decision(self.worker, before, self.rows([110] * 3, [189.9] * 3))[0])
+
+    def test_obvious_outlier_is_unstable_and_cannot_be_accepted_as_improvement(self):
+        before = self.rows([100] * 3, [200] * 3)
+        after = self.rows([60, 100, 105], [195, 200, 205])
+        after[0]["estimated_retrans_pct"] = 0.4
+        self.assertFalse(MODULE.base_decision(self.worker, before, after)[0])
+        self.assertTrue(any("不稳定" in reason for reason in MODULE.base_decision(self.worker, before, after)[1]))
+        after[1]["estimated_retrans_pct"] = 0.4
+        self.assertFalse(MODULE.base_decision(self.worker, before, after)[0])
+
+    def test_material_retrans_increase_is_rejected_even_within_the_same_band(self):
+        before = self.rows([100] * 3, [200] * 3, 0.1)
+        after = self.rows([120] * 3, [240] * 3, 0.3)
+        self.assertFalse(MODULE.base_decision(self.worker, before, after)[0])
+
     def test_raised_shaper_requires_original_throughput_band_and_stable_excess(self):
         reference = self.rows([600] * 3, [940] * 3)
         self.assertTrue(MODULE.shape_decision(self.worker, reference, self.rows([550] * 3, [800] * 3), 500, 900, 75)[0])
@@ -203,6 +229,34 @@ class QueueTests(unittest.TestCase):
             MODULE.QueueState.restore(state)
         root = next(args for args in calls if "replace" in args and "root" in args)
         self.assertEqual(root[root.index("handle") + 1], "2:")
+
+    def test_automatic_zero_handle_queue_already_matches_snapshot(self):
+        for kind, options in (("fq", "limit 10000p flow_limit 100p"), ("fq_codel", "limit 10240p ecn")):
+            with self.subTest(kind=kind):
+                original = "qdisc {} 0: root refcnt 2 {}\n".format(kind, options)
+                state = self.capture(original)
+                def run(args, **kwargs):
+                    if "change" in args or "replace" in args:
+                        raise MODULE.TaskError("内核自动队列已经恢复，不应再次修改")
+                    return subprocess.CompletedProcess(args, 0, original if "show" in args else "", "")
+                with mock.patch.object(MODULE, "command", side_effect=run):
+                    MODULE.QueueState.restore(state)
+
+    def test_automatic_zero_handle_with_different_options_is_recreated(self):
+        state = self.capture("qdisc fq 0: root limit 20000p flow_limit 200p\n")
+        actual = "qdisc fq 0: root limit 10000p flow_limit 100p\n"
+        def run(args, **kwargs):
+            nonlocal actual
+            if "change" in args:
+                raise MODULE.TaskError("Qdisc not found. To create specify NLM_F_CREATE flag.")
+            if "replace" in args:
+                actual = "qdisc fq 8001: root " + " ".join(args[args.index("fq") + 1:]) + "\n"
+            return subprocess.CompletedProcess(args, 0, actual if "show" in args else "", "")
+        with mock.patch.object(MODULE, "command", side_effect=run):
+            MODULE.QueueState.restore(state)
+        restored = self.capture(actual)
+        self.assertEqual(restored["qdiscs"][0]["options"], state["qdiscs"][0]["options"])
+        self.assertEqual(restored["qdiscs"][0]["kind"], "fq")
 
     def test_unrestorable_queue_and_filters_fail_before_mutation(self):
         for qdisc, filters in (("qdisc cake 1: root bandwidth 1Gbit\n", ""), ("qdisc fq 1: root future_option value\n", ""), ("qdisc fq 1: root\n", "filter protocol ip pref 1 flower")):

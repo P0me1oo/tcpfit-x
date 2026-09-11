@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tcpfit 一键部署
+# tcpfit 部署脚本
 #
 # 两种用法：
 #
@@ -73,8 +73,9 @@ if [ "$MODE" = agent ]; then
 
   echo
   echo "下一步："
+  echo "    tcpfit                              # 菜单 1 国际线路调优；菜单 2 优化线路调优"
   echo "    tcpfit detect                       # 看机器画像"
-  echo "    tcpfit return                       # 家宽主动接入的回国调优"
+  echo "    tcpfit return                       # 家宽主动接入的优化线路调优"
   echo "    tcpfit tune --role proxy --bw 500   # 基础调优"
   echo "    tcpfit sweep --peer <近处iperf3服务器> --nominal 500"
   echo "    tcpfit shape --rate <sweep给的推荐值>"

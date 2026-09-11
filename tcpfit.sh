@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # tcpfit — 单机 TCP 调优代理
 #
-# 原版调优使用 bash；回国双端模式另需 Python 3、curl 和 iperf3。
+# 国际线路调优使用 Bash；优化线路调优双端模式另需 Python 3、curl 和 iperf3。
 # 所有"该设多少"的判断都由实测或机器规格推导, 不使用抄来的固定值.
+#
+# 菜单 1：国际线路调优；菜单 2：优化线路调优。
 #
 # 用法:
 #   tcpfit.sh                               交互式菜单（不带参数即可, 推荐）
-#   tcpfit.sh return [选项]                  回国调优（家宽主动接入，仅服务器调参）
-#   tcpfit.sh return-recover                 重试未完成的回国任务恢复
+#   tcpfit.sh return [选项]                  优化线路调优（家宽主动接入，仅服务器调参）
+#   tcpfit.sh return-recover                 重试未完成的优化线路调优任务恢复
 #   tcpfit.sh detect                        输出机器画像
 #   tcpfit.sh probe  --peer HOST            探测可用带宽(虚拟网卡读不到标称值时用)
 #   tcpfit.sh tune   [选项]                 应用基础调优
+#   tcpfit.sh buffer --max-mb N [--default-mb N]  自定义 TCP 缓冲区（MiB）
 #   tcpfit.sh sweep  --peer HOST [选项]     实测限速器拐点 (-4/-6 指定协议族, 默认 -4)
 #   tcpfit.sh shape  --rate N | --off       应用/移除出向整形
 #   tcpfit.sh harden --swap 2G              加 swap（小内存机防止进程被杀）
@@ -33,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.6.0"
+VERSION="0.9.1"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -90,7 +93,7 @@ take_lock(){
   mkdir -p "$(dirname "$LOCK_FILE")" || die "无法创建任务锁目录"
   exec 9>>"$LOCK_FILE" || die "无法打开任务锁: $LOCK_FILE"
   flock -n 9 || die "已有 tcpfit 任务正在运行，请等待其结束后重试（锁: $LOCK_FILE）"
-  [ "${1:-}" = recovery ] || [ ! -f "$STATE_DIR/return-pending.json" ] || die "存在尚未恢复完成的回国任务，请先执行 tcpfit return-recover"
+  [ "${1:-}" = recovery ] || [ ! -f "$STATE_DIR/return-pending.json" ] || die "存在尚未恢复完成的优化线路调优任务，请先执行 tcpfit return-recover"
   LOCK_HELD=1
 }
 
@@ -274,7 +277,7 @@ have_ipv6(){
 }
 
 PEER_PORT="${PEER_PORT:-5201}"   # 选定对端时确定的可用端口
-WIZARD=0                         # 一键流程内为 1：子命令只输出执行日志, 收尾统一由 wizard 打印
+WIZARD=0                         # 国际线路调优流程内为 1：子命令只输出执行日志, 收尾统一由 wizard 打印
 # 装成不带扩展名的 tcpfit, 放 /usr/local/bin —— 用户敲 `tcpfit` 就能进菜单.
 # 不用 /usr/local/sbin 是因为它不在普通用户的 PATH 里, 非 root 敲命令会「找不到命令」,
 # 而不是看到「需要 root 权限」这个有用的提示.
@@ -439,13 +442,13 @@ clear_owned_initcwnd(){
 #     移动 55ms / 联通 93ms / 电信 138ms / 上海电信 145ms, 差 2.6 倍,
 #     再叠加晚高峰. 测出来的只是这个分布里随机的一个点.
 #
-# 为什么是 150 —— 它覆盖常见的跨境代理路径, 再给 socket 2×BDP + 2MB:
+# 默认按 150 ms 估算往返延迟，缓冲区从 1.5×BDP + 2 MiB 起步：
 #     优化线 40-70ms / 香港普通线 145ms / 美西 160-180ms / 欧美 230-250ms /
 #     晚高峰拥塞 300ms 都不会按某次不可靠的 ping 把缓冲区算得特别小.
 # 这不是承诺单流全速覆盖到 300ms: tcp_adv_win_scale=1 会为协议和应用预留
 # 一部分 socket 空间, 实际可通告窗口还受内核记账、路径和对端共同影响.
 # 再提高默认估值收益有限, 而且
-#     小内存机器早被 RAM/32 封顶接住(512MB→16MB), 估多高结果都一样;
+#     小内存机器会被内存试调上限截断（512 MiB 档为 24 MiB）;
 #     大机器上则要多付 BBR 超发的账 —— 实测超配 215 倍时掉 22% 吞吐.
 # 估低才是真危险: 估 40 时缓冲区会算得过小, 2G 口到美西只剩 941 Mbps(47%),
 #     而且是硬天花板, 用户怎么测都上不去还查不出原因.
@@ -520,45 +523,44 @@ calc_tcp_mem(){
   }'
 }
 
-# 缓冲区上限 = 2 × BDP + 2MiB, 但要受全局 TCP 预算约束.
-# tcp_adv_win_scale=1 会为协议/应用预留 socket 空间, 刚好 2×BDP 没有余量.
-# 300M/168ms 真机平衡换序 A/B 中, 11.25MB 平均接收 257.3M, 加 2MiB 后为
-# 272.7M; 原机 13.575MB 同为 272.7M, 全部 0 重传. 固定余量能拿回主要差距,
-# 又不会按比例放大 500M 以上机器的缓冲区. 500M/156ms A/B 中
-# 18.75-30MB 没有可测收益.
+# 基础调优默认初始缓冲区上限 = 1.5 × BDP + 2 MiB，再受本机内存范围约束。
+# 倍率用于初始估算，固定余量为窗口和内核记账留出空间；最终是否保留由实测决定。
+# 优化线路调优由协调模块改用 2 × BDP；共用内存约束，显示各自实际使用的公式。
 #
-# 原先是死写的 [4MB, 64MB]. 64MB 这个数在两头都错：
-#   高带宽机被无谓截断 —— 2G/149ms 的机器 2×BDP 是 71MB, 被砍成 64MB,
-#   接收窗口只剩 32MB, 单流上限 1.93Gbps, 刚好够不到 2G.
-#   小内存机又太松 —— 1GB 的机器也允许单个 socket 占 64MB, 几条大流就吃光 tcp_mem.
+# 常规上限为内存的 1/32，绝对上限 256 MiB。512 MiB 档允许试到收发各
+# 24 MiB；MemTotal 至少 448 MiB 即归入此档，容纳内核保留内存造成的差额。
+# 更小的机器仍按原比例限制，超过此档后上限不下降；tcp_mem 总预算保持不变。
 #
-# 改成跟 tcp_mem 挂钩：单个 socket 最多占全局 TCP 预算的 1/8, 即至少要能容下
-# 8 条大流同时跑满. tcp_mem 上限本身是内存的 1/4, 所以这个值 ≈ 内存的 1/32.
-# 绝对上限 256MB —— 再大就是单条连接垄断全局预算了, 收益也早已递减.
-#
-# 注意 rmem_max/wmem_max 是「天花板」不是预分配：开着 tcp_moderate_rcvbuf,
-# 连接从 default 值起步, 只有真跑得快才长上去. 而 tcp_mem 是内核硬性拦截的总量,
-# 所以调大这里不会把机器 OOM 掉, 最坏是 TCP 进入内存压力后缓冲区被自动缩小.
+# 上限不是预分配，也不保证高并发时没有内存压力；优化线路调优模式还会检查可用内存，
+# 并用实际接收速度和重传决定是否保留候选。
+calc_buf_limit(){   # calc_buf_limit <内存MiB>
+  awk -v m="$1" 'BEGIN{
+    cap = m*32768
+    if(m >= 448 && cap < 25165824) cap = 25165824
+    if(cap > 268435456) cap = 268435456
+    if(cap < 4194304) cap = 4194304
+    printf "%d", cap
+  }'
+}
+
 calc_buf_max(){   # calc_buf_max <BDP字节> <内存MB>
-  awk -v b="$1" -v m="$2" 'BEGIN{
-    v   = b*2 + 2097152
-    cap = m*32768              # tcp_mem上限(内存1/4)的 1/8 = 内存/32, 单位字节
-    if(cap > 268435456) cap = 268435456      # 绝对上限 256MB
+  local limit; limit=$(calc_buf_limit "$2")
+  awk -v b="$1" -v cap="$limit" 'BEGIN{
+    v   = int(b*1.5 + 2097152)
     if(v > cap) v = cap
     if(v < 4194304) v = 4194304              # 下限 4MB, 低于此连百兆都跑不满
     printf "%d", v
   }'
 }
 
-# buf_max 是被哪个条件定住的 —— 输出里说明白, 否则用户看到一个被截断的值
-# 却以为是 2×BDP, 会去怀疑别的地方（我自己就在 9300 那台上绕过弯路）.
+# 显示最终上限来自公式、内存限制还是最小值。
 buf_max_reason(){   # buf_max_reason <BDP字节> <内存MB> <算出的buf_max>
-  awk -v b="$1" -v m="$2" -v v="$3" 'BEGIN{
-    target = b*2 + 2097152
-    cap = m*32768; if(cap > 268435456) cap = 268435456
-    if(v <= 4194304 && target < 4194304) { print "floor 4MB"; exit }
-    if(v >= cap && target > cap)         { printf "capped by tcp_mem budget"; exit }
-    print "2 x BDP + 2MB headroom"
+  local limit; limit=$(calc_buf_limit "$2")
+  awk -v b="$1" -v cap="$limit" -v v="$3" 'BEGIN{
+    target = int(b*1.5 + 2097152)
+    if(v <= 4194304 && target < 4194304) { print "下限 4 MiB"; exit }
+    if(v >= cap && target > cap)         { printf "受本机内存试调上限约束"; exit }
+    print "1.5 × BDP + 2 MiB 余量"
   }'
 }
 
@@ -618,6 +620,182 @@ calc_buf_default(){
     bulk)  awk -v b="$bdp" 'BEGIN{v=b; if(v<1048576)v=1048576; if(v>8388608)v=8388608; printf "%d", v}' ;;
     *)     echo 2097152 ;;
   esac
+}
+
+# 基础调优和优化线路调优共用推导入口，各自选用初值公式；默认值不能超过上限。
+calc_buffer_profile(){   # <角色> <带宽Mbps> <RTT毫秒> <内存MB>
+  local bdp maximum initial limit
+  bdp=$(calc_bdp "$2" "$3")
+  maximum=$(calc_buf_max "$bdp" "$4")
+  initial=$(calc_buf_default "$1" "$bdp")
+  [ "$initial" -le "$maximum" ] || initial="$maximum"
+  limit=$(calc_buf_limit "$4")
+  printf '%s %s %s %s\n' "$bdp" "$maximum" "$initial" "$limit"
+}
+
+BUFFER_KEYS="net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default net.ipv4.tcp_rmem net.ipv4.tcp_wmem"
+
+# 先完整读取并校验，避免缺少某个参数时已经改动了其他参数。
+read_buffer_config(){
+  local key raw count number values=() normalized=()
+  for key in $BUFFER_KEYS; do
+    raw=$(sysctl -n "$key" 2>/dev/null) || { warn "无法读取缓冲区参数: $key"; return 1; }
+    read -r -a values <<<"$raw"
+    count=1
+    case "$key" in net.ipv4.tcp_rmem|net.ipv4.tcp_wmem) count=3 ;; esac
+    [ "${#values[@]}" = "$count" ] || { warn "缓冲区参数不完整: $key"; return 1; }
+    normalized=()
+    for number in "${values[@]}"; do
+      is_posint "$number" 1 2147483647 || { warn "缓冲区参数不是有效整数: $key"; return 1; }
+      normalized+=("$((10#$number))")
+    done
+    printf '%s=%s\n' "$key" "${normalized[*]}"
+  done
+}
+
+format_mib(){ awk -v bytes="$1" 'BEGIN{v=bytes/1048576; if(v==int(v))printf "%.0f MiB",v; else printf "%.2f MiB",v}'; }
+
+# 只更新六项缓冲区参数。子 shell 独立管理中断与失败恢复，不覆盖调用者的 trap。
+apply_buffer_config(){ (
+  local maximum="$1" initial="${2:-}" previous key value chosen minimum actual
+  local keys=() old=() next=() parts=() index candidate="" backup="" touched=0 persisted=0 committed=0 restore_log_fd
+  is_posint "$maximum" 1 1073741824 || { warn "缓冲区上限必须在 1-1073741824 字节之间"; return 1; }
+  maximum=$((10#$maximum))
+  if [ -n "$initial" ]; then
+    is_posint "$initial" 1 "$maximum" || { warn "缓冲区默认值不能超过上限"; return 1; }
+    initial=$((10#$initial))
+  fi
+  previous=$(read_buffer_config) || return 1
+  while IFS='=' read -r key value; do
+    keys+=("$key"); old+=("$value")
+    case "$key" in
+      net.core.rmem_max|net.core.wmem_max) chosen="$maximum" ;;
+      net.core.rmem_default|net.core.wmem_default)
+        chosen="${initial:-$value}"
+        [ "$chosen" -le "$maximum" ] || chosen="$maximum" ;;
+      *)
+        read -r -a parts <<<"$value"
+        minimum="${parts[0]}"; chosen="${initial:-${parts[1]}}"
+        [ "$chosen" -le "$maximum" ] || chosen="$maximum"
+        [ "$minimum" -le "$chosen" ] || { warn "$key 的最小值超过请求的默认值或上限，未修改"; return 1; }
+        chosen="$minimum $chosen $maximum" ;;
+    esac
+    next+=("$chosen")
+  done <<<"$previous"
+  if [ -L "$SYSCTL_FILE" ] || { [ -e "$SYSCTL_FILE" ] && [ ! -f "$SYSCTL_FILE" ]; }; then
+    warn "缓冲区配置需要普通文件: $SYSCTL_FILE"; return 1
+  fi
+  exec {restore_log_fd}>&2
+
+  buffer_cleanup(){
+    local rc=$? restored=1 i current
+    trap - EXIT HUP INT TERM
+    if [ "$touched" = 1 ] && [ "$committed" = 0 ]; then
+      for i in "${!keys[@]}"; do
+        current=$(sysctl -n "${keys[i]}" 2>/dev/null | awk '{$1=$1;print}')
+        [ "$current" = "${old[i]}" ] || sysctl -qw "${keys[i]}=${old[i]}" 2>/dev/null || restored=0
+      done
+      current=$(read_buffer_config) || restored=0
+      [ "$current" = "$previous" ] || restored=0
+      if [ "$persisted" = 1 ]; then
+        if [ -n "$backup" ]; then
+          if ! mv -f -- "$backup" "$SYSCTL_FILE"; then
+            restored=0
+            warn "原配置副本保留在: $backup" 2>&"$restore_log_fd"
+            backup=""
+          fi
+        else rm -f -- "$SYSCTL_FILE" || restored=0; fi
+      fi
+      if [ "$restored" = 1 ]; then warn "本次缓冲区修改未完成，已恢复修改前的值" 2>&"$restore_log_fd"
+      else warn "缓冲区恢复未完成，请按修改前存档恢复并检查系统报错" 2>&"$restore_log_fd"; fi
+      [ "$rc" != 0 ] || rc=1
+    fi
+    [ -z "$candidate" ] || rm -f -- "$candidate"
+    [ -z "$backup" ] || rm -f -- "$backup"
+    exit "$rc"
+  }
+  trap buffer_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  candidate=$(mktemp "${SYSCTL_FILE}.buffer.XXXXXX") || return 1
+  if [ -f "$SYSCTL_FILE" ]; then
+    backup=$(mktemp "${SYSCTL_FILE}.buffer-backup.XXXXXX") || return 1
+    cp -p -- "$SYSCTL_FILE" "$backup" || return 1
+    # 保留其他参数、注释和文件权限，移除缓冲区旧值及其重复项。
+    cp -p -- "$SYSCTL_FILE" "$candidate" || return 1
+    awk -v names="$BUFFER_KEYS" '
+      BEGIN{n=split(names,a," "); for(i=1;i<=n;i++) keys[a[i]]=1}
+      {key=$0; sub(/=.*/,"",key); gsub(/[[:space:]]/,"",key); sub(/^-/,"",key); gsub(/\//,".",key)
+       if(!(key in keys) && $0 !~ /^# TCP 缓冲区由 tcpfit buffer 设置/ && $0 !~ /^# 缓冲区：上限=/) print}
+    ' "$SYSCTL_FILE" > "$candidate" || return 1
+  else
+    printf '# 由 tcpfit v%s 生成\n' "$VERSION" > "$candidate" || return 1
+    chmod 644 "$candidate" || return 1
+  fi
+  {
+    printf '\n# TCP 缓冲区由 tcpfit buffer 设置，单位：字节\n'
+    for index in "${!keys[@]}"; do printf '%s = %s\n' "${keys[index]}" "${next[index]}"; done
+  } >> "$candidate" || return 1
+
+  touched=1
+  for index in "${!keys[@]}"; do
+    [ "${old[index]}" = "${next[index]}" ] && continue
+    sysctl -qw "${keys[index]}=${next[index]}" 2>/dev/null || {
+      warn "内核拒绝缓冲区参数: ${keys[index]}=${next[index]}"; return 1;
+    }
+  done
+  actual=$(read_buffer_config) || return 1
+  local expected
+  expected=$(for index in "${!keys[@]}"; do printf '%s=%s\n' "${keys[index]}" "${next[index]}"; done)
+  [ "$actual" = "$expected" ] || { warn "缓冲区实际值与请求值不一致，未保留"; return 1; }
+  persisted=1
+  mv -f -- "$candidate" "$SYSCTL_FILE" || { warn "缓冲区配置保存失败"; return 1; }
+  committed=1
+); }
+
+cmd_buffer(){
+  local maximum="" initial=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max-mb|--default-mb)
+        [ $# -ge 2 ] && [ -n "$2" ] || die "$1 缺少数值"
+        case "$1" in --max-mb) maximum="$2" ;; --default-mb) initial="$2" ;; esac
+        shift 2 ;;
+      -h|--help)
+        printf '%s\n' '用法: tcpfit buffer --max-mb N [--default-mb N]' \
+          '单位为 MiB（1 MiB = 1048576 字节），N 为 1-1024 的整数。' \
+          '统一设置 TCP 收发缓冲区上限；默认值可另行指定，省略时保留并限制在新上限内。' \
+          '立即生效并持久化，修改前后自动保存存档。'
+        return 0 ;;
+      *) die "未知缓冲区参数: $1" ;;
+    esac
+  done
+  is_posint "$maximum" 1 1024 || die "--max-mb 必须是 1-1024 的整数（MiB）"
+  maximum=$((10#$maximum))
+  if [ -n "$initial" ]; then
+    is_posint "$initial" 1 "$maximum" || die "--default-mb 必须为正整数且不能超过 --max-mb"
+    initial=$((10#$initial * 1048576))
+  fi
+  need_root
+  take_lock
+  local before key value values=()
+  local ARCH_MODE=buffer ARCH_RETURN_SNAPSHOT="" ARCH_RUN="" ARCH_ROLE="" ARCH_BW="" ARCH_RTT="" ARCH_PEER=""
+  before=$(read_buffer_config) || return 1
+  take_snapshot || return 1
+  archive_save "before-buffer-${maximum}MiB" || { warn "修改前存档失败，未调整缓冲区"; return 1; }
+  while IFS='=' read -r key value; do
+    read -r -a values <<<"$value"
+    case "$key" in
+      net.ipv4.tcp_rmem) info "TCP 接收缓冲区上限：$(format_mib "${values[2]}") → ${maximum} MiB" ;;
+      net.ipv4.tcp_wmem) info "TCP 发送缓冲区上限：$(format_mib "${values[2]}") → ${maximum} MiB" ;;
+    esac
+  done <<<"$before"
+  apply_buffer_config "$((maximum * 1048576))" "$initial" || return 1
+  ok "TCP 收发缓冲区上限已设为 ${maximum} MiB，已保存到 $SYSCTL_FILE"
+  kv "tcp_rmem" "$(sysctl -n net.ipv4.tcp_rmem)"
+  kv "tcp_wmem" "$(sysctl -n net.ipv4.tcp_wmem)"
+  archive_save "buffer-${maximum}MiB" || warn "缓冲区已生效，但修改后存档未成功；修改前存档仍可恢复"
 }
 
 # 调优会动到的全部内核参数. 快照和回滚都以这份清单为准 ——
@@ -1128,8 +1306,8 @@ archive_restore(){
   local return_snapshot
   return_snapshot=$(sed -n 's/^RETURN_SNAPSHOT=//p' "$f")
   if [ -n "$return_snapshot" ]; then
-    [ -f "$return_snapshot" ] || { warn "回国完整配置文件缺失: $return_snapshot，未执行部分恢复"; return 1; }
-    return_assets || { warn "无法加载回国恢复模块"; return 1; }
+    [ -f "$return_snapshot" ] || { warn "优化线路调优完整配置文件缺失: $return_snapshot，未执行部分恢复"; return 1; }
+    return_assets || { warn "无法加载优化线路调优恢复模块"; return 1; }
     python3 "$RETURN_HELPER" restore --snapshot "$return_snapshot" --lock-fd 9 || return 1
     ok "已恢复存档 $(archive_seq_of "$f") 的完整参数、队列和持久化配置"
     return 0
@@ -1459,9 +1637,8 @@ cmd_tune(){
   take_snapshot
 
   local bdp buf_max buf_def tcp_mem
-  bdp=$(calc_bdp "$bw" "$rtt")
-  buf_max=$(calc_buf_max "$bdp" "$ram")
-  buf_def=$(calc_buf_default "$role" "$bdp")
+  local buf_limit
+  read -r bdp buf_max buf_def buf_limit < <(calc_buffer_profile "$role" "$bw" "$rtt" "$ram")
   tcp_mem=$(calc_tcp_mem "$ram")
 
   info "Derived from: ${bw} Mbps / RTT ${rtt} ms / ${ram} MB RAM / role $role"
@@ -1479,12 +1656,12 @@ cmd_tune(){
   cat > "$SYSCTL_FILE" <<EOF
 # 由 tcpfit v$VERSION 生成  $(date -u +%FT%TZ)
 # 带宽=${bw}Mbps  RTT=${rtt}ms  内存=${ram}MB  角色=${role}
-# 勿手改；要改用 tcpfit tune 重新生成
+# 完整调优用 tcpfit tune；只改缓冲区用 tcpfit buffer
 
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = $cc
 
-# 缓冲区：上限=2×BDP+2MiB余量, 默认值按角色（默认值决定爬坡快慢, 也决定每连接内存占用）
+# 缓冲区：初始上限=${TCPFIT_BUFFER_FORMULA:-1.5×BDP+2MiB余量}, 默认值按角色（默认值决定爬坡快慢, 也决定每连接内存占用）
 net.core.rmem_max = $buf_max
 net.core.wmem_max = $buf_max
 net.core.rmem_default = $buf_def
@@ -2104,7 +2281,7 @@ loss_pct(){   # loss_pct <重传数> <吞吐Mbps> <秒数>
   }'
 }
 
-# 公共节点扫描和回国验证共用判据；回国模式不另选算法或缓冲区候选。
+# 国际线路调优和公共节点验证使用以下判据；优化线路调优使用独立的双模式重传阈值。
 RETRANS_THRESHOLD=0.1
 VERIFY_GOOD_PCT=90
 VERIFY_ACCEPT_PCT=75
@@ -2277,7 +2454,7 @@ cmd_sweep(){
   # LA 机不限速 481 Mbps / 丢包 5.70%, 而真实拐点在 530(限到 530 反而跑 499);
   # 美国机不限速 1262 / 3.44%, 拐点 1340. 从不限速吞吐往下找会直接错过.
   #
-  # 用单流: 多流的丢包归因不干净, 而且这个项目面向国内优化线路, 单流是实际场景.
+  # 使用单连接观察限速器，避免多连接并发掩盖单连接表现。
   local ug="" ug_recv="" ulp="" cap_gp="" cap_streams=1 single_printed=0
   if [ -z "$user_range" ]; then
     info "Unshaped probe (no rate limit, ${dur}s, 1 stream)"
@@ -2543,7 +2720,7 @@ cmd_sweep(){
   [ -n "$margin" ] || margin=$(calc_margin "$nominal")
   local final=$(( knee - margin )); [ "$final" -lt 1 ] && final=$knee
   mkdir -p "$STATE_DIR"; echo "KNEE=$knee"$'\n'"RECOMMEND=$final" > "$STATE_DIR/sweep.result"
-  # 一键流程里这些数字由 wizard 在「结果」里统一呈现, 这里只出执行日志
+  # 国际线路调优流程里这些数字由 wizard 在「结果」里统一呈现, 这里只出执行日志
   if [ "$WIZARD" = 1 ]; then
     ok "Knee ${knee} Mbit, margin ${margin} Mbit -> shape at ${final} Mbit"
     return 0
@@ -2587,7 +2764,7 @@ cmd_status(){
 
 # 验证「本机端口能力」. 刻意用近端对端 —— 测的是服务器出口能发多快、
 # 整形有没有生效, 不是到国内的速度（那取决于线路质量, 见 cmd_cntest）.
-# 实测 + 判定拆开：一键流程要把执行日志（英文）和结论（中文）分在两段里打印.
+# 实测 + 判定拆开：国际线路调优流程要把执行日志（英文）和结论（中文）分在两段里打印.
 VS1=""; VG1=""; VR1=""; VS4=""; VG4=""; VR4=""; VDUR=10
 verify_measure(){
   local peer="$1" res
@@ -2635,9 +2812,9 @@ verify_verdict(){
   # 没有整形时不能说"整形值设高了" —— 用户会被指去调一个根本不存在的东西
   local advice
   if [ -n "$target" ] && [ "$target" -gt 0 ] 2>/dev/null; then
-    advice="整形值可能设高了, 可以重跑菜单 3 重新找拐点"
+    advice="整形值可能设高了, 可以重跑菜单 4 重新找拐点"
   else
-    advice="这台没有应用整形. 高丢包来自链路本身或未被识别的限速器, 可以跑菜单 3 试着扫一次拐点"
+    advice="这台没有应用整形. 高丢包来自链路本身或未被识别的限速器, 可以跑菜单 4 试着扫一次拐点"
   fi
   case "$(retrans_band "$lp4")" in
     0) ok "估算重传比 ${lp4}%, 较低" ;;
@@ -2707,7 +2884,7 @@ cmd_update(){
   echo
   confirm "  现在更新？" y || { info "已取消"; return 0; }
 
-  # 主程序和回国模块必须来自同一版本，并逐个通过发布清单校验。
+  # 主程序和优化线路调优模块必须来自同一版本，并逐个通过发布清单校验。
   command -v sha256sum >/dev/null || die "需要 sha256sum 校验更新文件"
   local dl; dl=$(mktemp -d)
   local base="https://github.com/$REPO/releases/download/v$latest"
@@ -2729,7 +2906,7 @@ cmd_update(){
   for f in tcpfit-return.py tcpfit-client.sh; do
     if ! curl -fsSL --max-time 60 "$base/$f" -o "$dl/$f" || \
        ! (cd "$dl" && grep -F "  $f" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
-      rm -rf "$dl"; die "回国模块 $f 下载或校验失败，未更新" 2
+      rm -rf "$dl"; die "优化线路调优模块 $f 下载或校验失败，未更新" 2
     fi
   done
   mkdir -p "$lib_dir" || { rm -rf "$dl"; die "无法创建模块目录"; }
@@ -2759,8 +2936,8 @@ cmd_update(){
   warn "当前进程跑的仍是 v${VERSION} 的代码, 重新运行 tcpfit 才会用上新版本."
 }
 
-# ── 回国调优 ────────────────────────────────────────────────────────────────
-# 回国模块只负责接入、事务和路径数据；参数推导、基础调优及验证仍调用本文件。
+# ── 优化线路调优 ────────────────────────────────────────────────────────────────
+# 优化线路调优由协调模块管理接入、测量、分阶段调整和恢复，复用本文件的参数应用与测速函数。
 return_assets(){
   local here dest dl f
   here=$(cd "$(dirname "$SOURCE_FILE")" 2>/dev/null && pwd)
@@ -2793,7 +2970,7 @@ return_dependencies(){
     command -v "$c" >/dev/null || missing+=("$c")
   done
   [ "${#missing[@]}" = 0 ] && return 0
-  info "安装回国调优依赖: ${missing[*]}"
+  info "安装优化线路调优依赖: ${missing[*]}"
   if command -v apt-get >/dev/null; then
     command -v debconf-set-selections >/dev/null && printf 'iperf3 iperf3/start_daemon boolean false\n' | debconf-set-selections
     apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
@@ -2808,50 +2985,127 @@ return_dependencies(){
 cmd_return_recover(){
   need_root
   take_lock recovery
-  [ -f "$STATE_DIR/return-pending.json" ] || { info "没有待恢复的回国任务"; return 0; }
-  return_assets || die "无法加载回国恢复模块"
+  [ -f "$STATE_DIR/return-pending.json" ] || { info "没有待恢复的优化线路调优任务"; return 0; }
+  return_assets || die "无法加载优化线路调优恢复模块"
   local record
   record=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["record_dir"])' "$STATE_DIR/return-pending.json") || die "恢复记录无法读取"
   python3 "$RETURN_HELPER" recover --record-dir "$record" --lock-fd 9 || return 1
-  ok "回国任务的参数恢复和临时资源清理已完成"
+  ok "优化线路调优任务的参数恢复和临时资源清理已完成"
+}
+
+# 自动探测只接受对应协议族的公网地址；手动指定仍可使用域名或私网地址。
+is_public_server_ip(){
+  case "$1" in ''|*[!0-9a-fA-F:.]*) return 1 ;; esac
+  awk -v address="$1" -v family="${IP_FAMILY#-}" 'BEGIN {
+    if (family == 4) {
+      if (address !~ /^[0-9.]+$/ || split(address, octets, ".") != 4) exit 1
+      for (i=1; i<=4; i++)
+        if (octets[i] !~ /^(0|[1-9][0-9]*)$/ || length(octets[i]) > 3 || octets[i]+0 > 255) exit 1
+      a=octets[1]+0; b=octets[2]+0; c=octets[3]+0
+      if (a == 0 || a == 10 || a == 127 || a >= 224 ||
+          (a == 100 && b >= 64 && b <= 127) ||
+          (a == 169 && b == 254) || (a == 172 && b >= 16 && b <= 31) ||
+          (a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)))) ||
+          (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100))) ||
+          (a == 203 && b == 0 && c == 113)) exit 1
+    } else {
+      address=tolower(address)
+      if (address !~ /^[23][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f:]+$/ ||
+          address ~ /:::/ || address ~ /[^:]:$/) exit 1
+      compressed=address
+      if (gsub(/::/, ":", compressed) > 1) exit 1
+      n=split(address, groups, ":"); count=0
+      for (i=1; i<=n; i++) {
+        if (length(groups[i]) > 4) exit 1
+        if (groups[i] != "") count++
+      }
+      if (index(address, "::") ? count >= 8 : count != 8) exit 1
+      if (address ~ /^2001:0?db8:/ || address ~ /^2001:0*2:/ ||
+          (groups[1] == "3fff" && (length(groups[2]) < 4 || substr(groups[2], 1, 1) == "0"))) exit 1
+    }
+    exit 0
+  }'
+}
+
+detect_return_server(){
+  local destination=1.1.1.1 route address endpoint
+  [ "$IP_FAMILY" != -6 ] || destination=2606:4700:4700::1111
+  # 使用内核实际选路的源地址，不遍历可能含容器、隧道的所有网卡。
+  route=$(ip "$IP_FAMILY" route get "$destination" 2>/dev/null) || route=""
+  address=$(awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}' <<<"$route")
+  if is_public_server_ip "$address"; then printf '%s\n' "$address"; return 0; fi
+
+  # NAT 或本机地址不可用时查询公网出口；忽略代理，避免取得代理服务器的地址。
+  for endpoint in https://api64.ipify.org https://icanhazip.com; do
+    if command -v curl >/dev/null 2>&1; then
+      address=$(curl "$IP_FAMILY" -fsS --noproxy '*' --connect-timeout 2 --max-time 4 "$endpoint" 2>/dev/null) || continue
+    elif command -v wget >/dev/null 2>&1; then
+      address=$(wget "$IP_FAMILY" -qO- --no-proxy --timeout=4 --tries=1 "$endpoint" 2>/dev/null) || continue
+    else
+      return 1
+    fi
+    address=${address%$'\r'}
+    if is_public_server_ip "$address"; then printf '%s\n' "$address"; return 0; fi
+  done
+  return 1
 }
 
 cmd_return(){
   local server="" server_bw="" client_bw="" control_port=5211 iperf_port=5212 role=proxy yes=0 ttl=600
-  local ports_given=0 args=() choice
+  local ports_given=0 family_given=0 args=() choice repeats=2 repeats_given=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --server|--server-bw|--client-bw|--control-port|--iperf-port|--role|--token-ttl)
+      --server|--server-bw|--client-bw|--control-port|--iperf-port|--role|--token-ttl|--repeats)
         [ $# -ge 2 ] || die "$1 缺少参数"
         case "$1" in
           --server) server="$2" ;; --server-bw) server_bw="$2" ;; --client-bw) client_bw="$2" ;;
           --control-port) control_port="$2"; ports_given=1 ;; --iperf-port) iperf_port="$2"; ports_given=1 ;;
           --role) role="$2" ;; --token-ttl) ttl="$2" ;;
+          --repeats) repeats="$2"; repeats_given=1 ;;
         esac
         shift 2 ;;
-      -4|-6) IP_FAMILY="$1"; shift ;;
+      -4|-6) IP_FAMILY="$1"; family_given=1; shift ;;
       -y|--yes) yes=1; shift ;;
       -h|--help)
-        printf '%s\n' '用法: tcpfit return [--server 可达地址] [--server-bw Mbps] [--client-bw Mbps]' \
+        printf '%s\n' '优化线路调优' '用法: tcpfit return [--server 可达地址] [--server-bw Mbps] [--client-bw Mbps]' \
           '       [--control-port 5211] [--iperf-port 5212] [--role proxy|bulk|mixed] [-4|-6] [--yes]' \
           '       [--token-ttl 600]（30-1800 秒，配对成功即失效）' \
-          '带宽可留空。接入后自动测速和调优，只修改本服务器；家宽无需公网 IP。'
+          '       [--repeats 2]（每种连接数每次评估共测 2-10 次）' \
+          '服务器地址自动探测，失败后才需手动填写；也可用 --server 指定。' \
+          '带宽可留空。自动测速后回车保存推荐配置，或输入测速序号选配置；--yes 自动保存推荐。'
         return 0 ;;
-      *) die "未知回国调优参数: $1" ;;
+      *) die "未知优化线路调优参数: $1" ;;
     esac
   done
   need_root
   [ ! -f /etc/openwrt_release ] || die "OpenWrt / iStoreOS 本次仅支持测速端，请执行调优服务器生成的接入命令"
   take_lock
   if [ "$yes" = 0 ]; then
-    echo; step "回国调优"
+    echo; step "优化线路调优"
     echo "    家宽主动连接，服务器发送测试数据；接入后自动执行。"
     echo "    将保存当前配置，验证基础调优；已有整形只可能保持或验证后提高。"
     echo "    需要 python3、iperf3 和 curl，缺少时自动安装。"
     echo "    接入使用 HTTP；防火墙只复用已有工具，不安装。"
-    [ -n "$server" ] || server=$(ask "  家宽可访问的服务器地址（IP 或域名）" "")
+  fi
+  if [ -z "$server" ]; then
+    if [ "$family_given" = 0 ] && [ "$IP_FAMILY" = -4 ] && ! have_ipv4 && have_ipv6; then
+      IP_FAMILY=-6
+    fi
+    info "自动探测服务器 IPv${IP_FAMILY#-} 地址…"
+    if server=$(detect_return_server); then
+      ok "服务器地址: $server"
+    elif [ "$yes" = 0 ]; then
+      warn "未能自动获取服务器 IPv${IP_FAMILY#-} 公网地址，请手动填写"
+      server=$(ask "  家宽可访问的服务器地址（IP 或域名）" "")
+    fi
+  fi
+  [ -n "$server" ] || die "无法获取服务器可达地址，请使用 --server 指定，或重新进入菜单填写"
+  if [ "$yes" = 0 ]; then
     [ -n "$server_bw" ] || server_bw=$(ask "  服务器标称出口 Mbps（已知建议填，回车留空）" "")
     [ -n "$client_bw" ] || client_bw=$(ask "  家宽标称下载 Mbps（已知建议填，回车留空）" "")
+    if [ "$repeats_given" = 0 ]; then
+      repeats=$(ask "  每种连接数每次评估的测速次数（2-10）" 2)
+    fi
     if [ "$ports_given" = 0 ]; then
       control_port=$(ask "  接入端口 TCP" 5211)
       iperf_port=$(ask "  测速端口 TCP" 5212)
@@ -2859,11 +3113,11 @@ cmd_return(){
     choice=$(ask "  用途 1) 代理/加速  2) 大文件  3) 混合" 1)
     case "$choice" in 1) role=proxy ;; 2) role=bulk ;; 3) role=mixed ;; *) die "用途必须为 1、2 或 3" ;; esac
   fi
-  [ -n "$server" ] || die "缺少服务器可达地址，请使用 --server 或通过菜单填写"
   is_posint "$control_port" 1024 65535 || die "接入端口必须是 1024-65535 的整数"
   is_posint "$iperf_port" 1024 65535 || die "测速端口必须是 1024-65535 的整数"
   [ "$control_port" != "$iperf_port" ] || die "接入端口和测速端口不能相同"
   is_posint "$ttl" 30 1800 || die "token 有效期必须是 30-1800 秒"
+  is_posint "$repeats" 2 10 || die "测速次数必须是 2-10 的整数"
   [ -z "$server_bw" ] || is_posint "$server_bw" 1 1000000 || die "服务器标称带宽必须是 1-1000000 Mbps 的整数"
   [ -z "$client_bw" ] || is_posint "$client_bw" 1 1000000 || die "家宽标称带宽必须是 1-1000000 Mbps 的整数"
   case "$role" in proxy|bulk|mixed) ;; *) die "用途必须是 proxy / bulk / mixed" ;; esac
@@ -2871,7 +3125,8 @@ cmd_return(){
   _conf "服务器地址" "$server（IPv${IP_FAMILY#-}）"
   _conf "接入 / 测速端口" "$control_port / $iperf_port TCP"
   _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
-  _conf "测试方式" "单连接和四连接反向下载，约 6-10 分钟"
+  _conf "测试方式" "单连接和四连接每次评估各测 $repeats 次，任务限时 30 分钟"
+  _conf "缓冲区试调" "分两阶段，每轮只测当前连接数；合计最多 8 轮，连续 3 轮无收益停止"
   _conf "带宽含义" "实测是当前路径可用带宽，标称值仅作能力参考"
   local firewall_binary=iptables
   [ "$IP_FAMILY" != -6 ] || firewall_binary=ip6tables
@@ -2882,10 +3137,11 @@ cmd_return(){
   fi
   if [ "$yes" = 0 ]; then confirm "  开始并等待家宽接入？" y || { info "已取消"; return 0; }; fi
   return_dependencies || die "依赖准备失败，未开始测速"
-  return_assets || die "回国模块准备失败，请使用完整项目或 install.sh 安装同版本文件"
+  return_assets || die "优化线路调优模块准备失败，请使用完整项目或 install.sh 安装同版本文件"
   args=(run --script "$RETURN_MAIN" --client-script "$RETURN_CLIENT" --server "$server"
     --control-port "$control_port" --iperf-port "$iperf_port" --family "${IP_FAMILY#-}"
-    --role "$role" --token-ttl "$ttl" --state-dir "$STATE_DIR" --lock-fd 9)
+    --role "$role" --token-ttl "$ttl" --repeats "$repeats" --state-dir "$STATE_DIR" --lock-fd 9)
+  [ "$yes" = 0 ] || args+=(--yes)
   [ -z "$server_bw" ] || args+=(--server-bw "$server_bw")
   [ -z "$client_bw" ] || args+=(--client-bw "$client_bw")
   python3 "$RETURN_HELPER" "${args[@]}" &
@@ -3127,9 +3383,9 @@ confirm(){
   [[ "$a" =~ ^[Yy] ]]
 }
 
-# 框宽固定 48 列. 每行按显示宽度补齐后再包边框 ——
+# 框宽固定 58 列. 每行按显示宽度补齐后再包边框 ——
 # 手写空格对不齐, 因为 CJK 占 2 列而框线字符占 1 列.
-BOX_W=56
+BOX_W=58
 _row(){ # _row "<内容>" [颜色代码]
   local txt="$1" col="${2:-}" pad
   pad=$(( BOX_W - $(_dispw "$txt") ))
@@ -3144,7 +3400,7 @@ _bot(){ printf '╚'; printf '─%.0s' $(seq $BOX_W); printf '╝\n'; }
 # 菜单条目：中文名、英文名、耗时三列各自按显示宽度补齐.
 # 手写空格必然错位 —— 中文占 2 列,"~10 min" 这种右列一长就把右边框顶出去.
 _item(){ # _item <编号> <中文> <英文> [耗时]
-  _row "$(printf '  %s. %s %s %s ' "$1" "$(_pad "$2" 10)" "$(_pad "$3" 30)" "$(_rpad "${4:-}" 8)")"
+  _row "$(printf '  %2s. %s %s %s ' "$1" "$(_pad "$2" 12)" "$(_pad "$3" 25)" "$(_rpad "${4:-}" 12)")"
 }
 
 banner(){
@@ -3163,19 +3419,19 @@ banner(){
   _row "  VPS 补货频道  t.me/vpskuaibu"
   _row "  VPS 测评数据  spacevps.cc"
   _sep
-  _row "  0. Exit"
-  _item 1 "一键调优" "Auto-tune (recommended)"   "~10 min"
-  _item r "回国调优" "Return-path tuning"        "~6-10 min"
-  _item 2 "基础调优" "Base tuning only"          "~1 min"
-  _item 3 "拐点测试" "Policer sweep"             "~8 min"
-  _item 4 "加 swap"  "Add swap (low-memory box)"
+  _row "   0. Exit"
+  _item 1 "国际线路调优" "International tuning"   "~10 min"
+  _item 2 "优化线路调优" "Optimized route tuning"        "up to 30 min"
+  _item 3 "基础调优" "Base tuning only"          "~1 min"
+  _item 4 "拐点测试" "Policer sweep"             "~8 min"
+  _item 5 "加 swap"  "Add swap (low-memory box)"
   _sep
-  _item 5 "查看状态" "Status"
-  _item 6 "端口验证" "Verify port capability"    "~1 min"
-  _item 7 "回滚改动" "Rollback all changes"
-  _item 8 "检查更新" "Check for updates"
-  _item 9 "调优存档" "Tuning archives"
-  _row "  u. 卸载 tcpfit / Uninstall"
+  _item 6 "查看状态" "Status"
+  _item 7 "端口验证" "Verify port capability"    "~1 min"
+  _item 8 "回滚改动" "Rollback all changes"
+  _item 9 "检查更新" "Check for updates"
+  _item 10 "调优存档" "Tuning archives"
+  _row "  11. 卸载 tcpfit / Uninstall"
   _bot
   printf "  %-9s %s core / %s MB / %s\n" "Machine" "$cores" "$ram" "$(uname -r)"
   printf "  %-9s cc=%s  shaper=%s  " "Network" "${cc:-?}" "${shaper:-none}"
@@ -3184,7 +3440,7 @@ banner(){
   [ -n "$_stats" ] && printf "  %-9s %s\n" "Runs" "$_stats"
 }
 
-# 一键全自动.
+# 国际线路调优自动流程.
 # 设计原则：所有要用户回答的东西集中在最前面（3 个问题）, 确认之后一路跑到底不再打断；
 # 执行阶段的日志用英文（都是参数名和数值, 中英混排反而看不清）, 结论用中文.
 wizard(){
@@ -3195,7 +3451,7 @@ wizard(){
   local ARCH_ROLE="" ARCH_BW="" ARCH_RTT="" ARCH_PEER=""
   local ram; ram=$(detect_ram_mb)
   echo
-  echo "  ── 一键调优 ──"
+  echo "  ── 国际线路调优 ──"
   echo
   rule
   echo "  开始前的说明"
@@ -3670,10 +3926,9 @@ menu_loop(){
   while true; do
     banner
     echo
-    local c; c=$(ask "  请选择 / Select [0-9,r,u]" "1")
+    local c; c=$(ask "  请选择 / Select [0-11]" "1")
     echo
     case "$c" in
-      r|R) cmd_return; local rc=$?; drain_tty; exit "$rc" ;;
       1) wizard
          # 跑完直接退出, 不回菜单. 回菜单要经过 banner 的 clear, 而 clear 发的是
          # \033[H\033[2J\033[3J —— 那个 3J 连滚动回滚缓冲一起清掉, 往上翻也找不回
@@ -3685,7 +3940,8 @@ menu_loop(){
          # 进程一退, 它们就被父 shell 读走当命令执行（实测 ls -la / whoami 真的跑了）.
          drain_tty
          exit 0 ;;
-      2) local r; r=$(ask "  用途 1) 代理/加速  2) 大文件传输" "1")
+      2) cmd_return; local rc=$?; drain_tty; exit "$rc" ;;
+      3) local r; r=$(ask "  用途 1) 代理/加速  2) 大文件传输" "1")
          local role=proxy; [ "$r" = 2 ] && role=bulk
          local b; b=$(ask "  带宽 Mbps (回车=自动探测)" "")
          if [ -n "$b" ]; then cmd_tune --role "$role" --bw "$b"
@@ -3693,25 +3949,25 @@ menu_loop(){
            local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_tune --role "$role" --bw auto --peer "${p%:*}"
            else warn "No peer available; specify bandwidth manually"; fi
          fi ;;
-      3) local p; if p=$(auto_pick_peer); then
+      4) local p; if p=$(auto_pick_peer); then
            PEER_PORT="${p##*:}"; p="${p%:*}"
            local b; b=$(ask "  带宽 Mbps" "")
            cmd_sweep --peer "$p" --nominal "$b"
            local rate; rate=$(awk -F= '/^RECOMMEND/{print $2}' "$STATE_DIR/sweep.result" 2>/dev/null)
            [ -n "$rate" ] && confirm "  应用 ${rate}Mbit 整形？" y && cmd_shape --rate "$rate"
          else warn "No peer available"; fi ;;
-      4) if not_blank "$(swapon --show 2>/dev/null)"; then
+      5) if not_blank "$(swapon --show 2>/dev/null)"; then
            info "已有 swap: $(free -h | awk '/Swap/{print $2}'), 回车跳过；要再建就输入数字"
            local sg; sg=$(ask "  swap 大小 GB (1-20, 回车跳过)" ""); [ -n "$sg" ] && cmd_harden --swap "$sg"
          else
            echo "  输入 1-20 的数字（单位 GB）, 推荐 1-4；回车 = 2；输入 0 = 不创建."
            local sg; sg=$(ask "  swap 大小 GB" "2"); [ "$sg" != 0 ] && cmd_harden --swap "$sg"
          fi ;;
-      5) cmd_status ;;
-      6) local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_verify --peer "${p%:*}"; else cmd_verify; fi ;;
-      7) confirm "  确定回滚全部改动？" && cmd_rollback ;;
-      8) cmd_update --from-menu ;;
-      9) echo; archive_list; echo
+      6) cmd_status ;;
+      7) local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_verify --peer "${p%:*}"; else cmd_verify; fi ;;
+      8) confirm "  确定回滚全部改动？" && cmd_rollback ;;
+      9) cmd_update --from-menu ;;
+      10) echo; archive_list; echo
          local a; a=$(ask "  回滚到哪个存档？(序号, 回车跳过)" "")
          if [ -n "$a" ]; then
            local f
@@ -3722,7 +3978,7 @@ menu_loop(){
              [ "$find_rc" = 2 ] || warn "找不到存档: $a"
            fi
          fi ;;
-      u|U) cmd_uninstall; exit $? ;;
+      11) cmd_uninstall; exit $? ;;
       0) exit 0 ;;
       *) warn "Invalid selection" ;;
     esac
@@ -3737,13 +3993,14 @@ menu_loop(){
 # ── 入口 ────────────────────────────────────────────────────────────────────
 usage(){ awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
 
-# 支持回国协调进程加载同一份函数，以及隔离测试加载公共计算方法。
+# 支持优化线路调优协调进程加载同一份函数，以及隔离测试加载公共计算方法。
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "${1:-}" in
   return|return-tune) shift; cmd_return "$@" ;;
   return-recover) shift; cmd_return_recover "$@" ;;
   detect)   shift; cmd_detect "$@" ;;
   tune)     shift; cmd_tune "$@" ;;
+  buffer)   shift; cmd_buffer "$@" ;;
   probe)    shift; cmd_probe "$@" ;;
   sweep)    shift; cmd_sweep "$@" ;;
   shape)    shift; cmd_shape "$@" ;;
