@@ -123,6 +123,32 @@ class BufferCommandTests(unittest.TestCase):
         self.assertEqual(actual["net.core.rmem_default"], str(MIB))
         self.assert_persistent_matches_kernel()
 
+    def test_byte_sized_candidate_preserves_small_tcp_minimum_and_default(self):
+        for key in INITIAL:
+            value = "1875 1875 1875" if "tcp_" in key else "1875"
+            (self.directory / ("kernel." + key)).write_text(value + "\n", encoding="utf-8")
+        result = self.run_command("3125", "1875", extra='cmd_buffer(){ apply_buffer_config "$@"; }')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = self.kernel()
+        for key in ("net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem"):
+            self.assertEqual(actual[key], "1875 1875 3125")
+        self.assertEqual(actual["net.core.rmem_max"], "3125")
+        self.assertEqual(actual["net.core.rmem_default"], "1875")
+        self.assert_persistent_matches_kernel()
+
+    def test_bdp_candidate_above_one_gib_is_applied_but_integer_overflow_is_rejected(self):
+        extra = 'cmd_buffer(){ apply_buffer_config "$@"; }'
+        result = self.run_command("1250000000", str(MIB), extra=extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = self.kernel()
+        self.assertEqual(actual["net.ipv4.tcp_rmem"], "4096 {} 1250000000".format(MIB))
+        self.assert_persistent_matches_kernel()
+        writes = (self.directory / "writes").read_text(encoding="utf-8")
+        result = self.run_command("2147483648", str(MIB), extra=extra)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.kernel(), actual)
+        self.assertEqual((self.directory / "writes").read_text(encoding="utf-8"), writes)
+
     def test_invalid_arguments_are_rejected_before_lock_snapshot_or_writes(self):
         inputs = [(), ("--max-mb",), ("--max-mb", "0"), ("--max-mb", "-1"), ("--max-mb", "1.5"),
                   ("--max-mb", "1025"), ("--max-mb", "9999999999999999999999999999"),

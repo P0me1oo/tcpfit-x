@@ -26,13 +26,12 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 MIB = 1048576
-BUFFER_MIN_BYTES = 6 * MIB
+BUFFER_MAX_BYTES = 2147483647
 BUFFER_MIN_STEP = MIB
 BUFFER_GROW_STEP = 2 * MIB
 SPEED_TOLERANCE = 0.05
-SPEED_GAIN_MIN = 0.03
 MEASUREMENT_REPEATS = 2
 SPEED_SPREAD = 0.10
 RETRANS_TARGETS = {1: (0.5, 1.0), 4: (1.0, 5.0)}
@@ -585,29 +584,30 @@ ARCH_INCLUDE_SWEEP=0
 self_install(){ :; }
 migrate_legacy(){ :; }
 # 优化线路调优流程单独覆盖公式，普通基础调优保持原规则。
-TCPFIT_BUFFER_FORMULA="BDP+2MiB余量"
-calc_buf_max(){
-  local limit; limit=$(calc_buf_limit "$2")
-  awk -v b="$1" -v cap="$limit" 'BEGIN{v=int(b+2097152); if(v>cap)v=cap; if(v<6291456)v=6291456; printf "%d",v}'
+TCPFIT_BUFFER_FORMULA="1.5×BDP，试调上限2.5×BDP"
+calc_buffer_profile(){
+  local bdp maximum initial limit
+  bdp=$(calc_bdp "$2" "$3")
+  read -r maximum limit < <(awk -v b="$bdp" 'BEGIN{printf "%.0f %.0f\n",int(b*1.5),int(b*2.5)}')
+  if ! is_posint "$maximum" 1 2147483647 || ! is_posint "$limit" "$maximum" 2147483647; then
+    printf '%s\n' 'BDP 推导的缓冲区超出内核整数范围（1～2147483647 字节），停止优化线路调优' >&2
+    return 1
+  fi
+  initial=$(calc_buf_default "$1" "$bdp")
+  [ "$initial" -le "$maximum" ] || initial="$maximum"
+  printf '%s %s %s %s\n' "$bdp" "$maximum" "$initial" "$limit"
 }
 buf_max_reason(){
-  printf '%s' 'BDP + 2 MiB'
+  printf '%s' '1.5 × BDP，试调上限 2.5 × BDP'
 }
 action="$1"; shift
-case "$action" in
-  tune|buffer-plan)
-    if [ "$(calc_buf_limit "$(detect_ram_mb)")" -lt 6291456 ]; then
-      printf '%s\n' '本机内存试调上限低于 6 MiB 下限，停止优化线路调优' >&2
-      exit 1
-    fi ;;
-esac
 case "$action" in
   profile) printf '%s\n' "$(detect_iface)" "$DEFAULT_RTT" "$VDUR" "$VERIFY_GOOD_PCT" "$VERIFY_ACCEPT_PCT" ;;
   keys) printf '%s\n' $TUNED_KEYS ;;
   snapshot) take_snapshot ;;
   sample) run_iperf return-path "$2" "$1" ;;
   tune) cmd_tune "$@" ;;
-  buffer-plan) calc_buffer_profile "$1" "$2" "$3" "$(detect_ram_mb)" ;;
+  buffer-plan) calc_buffer_profile "$1" "$2" "$3" ;;
   buffers) read_buffer_config ;;
   buffer) apply_buffer_config "$@" ;;
   fq) qdisc_remove_root "$1" && qdisc_set_fq "$1" ;;
@@ -1304,7 +1304,7 @@ def speed_issues(baseline, measured, streams):
 def mode_goal(baseline, measured, streams):
     return (not measurement_issues(measured, streams)
             and not speed_issues(baseline, measured, streams)
-            and median_metric(measured, streams, "estimated_retrans_pct") <= RETRANS_TARGETS[streams][0] + METRIC_EPSILON)
+            and median_metric(measured, streams, "estimated_retrans_pct") <= RETRANS_TARGETS[streams][1])
 
 
 def retrans_acceptable(worker, before, after, tolerant=False, modes=(1,)):
@@ -1324,10 +1324,12 @@ def retrans_acceptable(worker, before, after, tolerant=False, modes=(1,)):
 def base_decision(worker, before, after):
     if before is None:
         return False, ["未取得稳定测速参照，无法确认候选效果"]
-    reasons = retrans_acceptable(worker, before, after, tolerant=True)
-    if not measurement_issues(before, 1) and not measurement_issues(after, 1):
+    reasons = measurement_issues(before, 1) + measurement_issues(after, 1)
+    if not reasons:
         reasons.extend(speed_issues(before, after, 1))
-    return not reasons, reasons or ["速度合格，重传稳定"]
+        if median_metric(after, 1, "estimated_retrans_pct") > RETRANS_TARGETS[1][1]:
+            reasons.append("单连接估算重传比超过 1%")
+    return not reasons, reasons or ["测速稳定，重传不超过 1%，速度下降不超过 5%"]
 
 
 def buffers_from_sysctl(values):
@@ -1349,6 +1351,10 @@ def read_buffers(worker):
 
 
 def format_mib(value):
+    if value < 1024:
+        return "{} 字节".format(value)
+    if value < MIB:
+        return "{:.2f}".format(value / 1024).rstrip("0").rstrip(".") + " KiB"
     return "{:.2f}".format(value / MIB).rstrip("0").rstrip(".") + " MiB"
 
 
@@ -1406,30 +1412,30 @@ def describe_measurements(measured):
     return "；".join(parts)
 
 
-def next_buffer_target(current, limit, direction, step, visited):
+def next_buffer_target(current, limit, direction, step, visited, minimum):
     """优先沿当前方向缩步；跳过已测上限继续向边界搜索，再尝试反向。"""
 
     for candidate_direction in (direction, -direction):
         candidate_step = step if candidate_direction == direction else BUFFER_MIN_STEP
         while True:
-            target = min(limit, max(BUFFER_MIN_BYTES, current + candidate_direction * candidate_step))
+            target = min(limit, max(minimum, current + candidate_direction * candidate_step))
             if target != current and target not in visited:
                 return target, candidate_direction, abs(target - current)
             if candidate_step <= BUFFER_MIN_STEP:
                 break
             candidate_step = max(BUFFER_MIN_STEP, candidate_step // 2)
-        target = min(limit, max(BUFFER_MIN_BYTES, current + candidate_direction * BUFFER_MIN_STEP))
+        target = min(limit, max(minimum, current + candidate_direction * BUFFER_MIN_STEP))
         while target != current:
             if target not in visited:
                 return target, candidate_direction, abs(target - current)
-            if target in (BUFFER_MIN_BYTES, limit):
+            if target in (minimum, limit):
                 break
-            target = min(limit, max(BUFFER_MIN_BYTES, target + candidate_direction * BUFFER_MIN_STEP))
+            target = min(limit, max(minimum, target + candidate_direction * BUFFER_MIN_STEP))
     return None
 
 
 def next_buffer_growth_target(current, limit, visited):
-    """重传优秀时按 2 MiB 试更高上限，跳过已测候选。"""
+    """重传不高时按 2 MiB 试更大上限，跳过已测候选。"""
     target = min(limit, current + BUFFER_GROW_STEP)
     while target > current:
         if target not in visited:
@@ -1450,33 +1456,23 @@ def next_buffer_refine_target(previous_candidate, retained, visited):
     return None
 
 
-def buffer_improvement(baseline, before, after, streams):
+def buffer_improvement(baseline, before, after, streams, before_max, after_max):
     if measurement_issues(after, streams) or speed_issues(baseline, after, streams):
         return []
-    # 旧测量不稳定时只能确认新组达标，不能声称相对旧组有收益。
-    if measurement_issues(before, streams):
-        return ["当前连接数经稳定复测已达标"] if mode_goal(baseline, after, streams) else []
-    previous = median_metric(before, streams, "estimated_retrans_pct")
     current = median_metric(after, streams, "estimated_retrans_pct")
-    if current > previous + retrans_tolerance(previous) + METRIC_EPSILON:
+    if current <= RETRANS_TARGETS[streams][1]:
+        if after_max > before_max:
+            return ["{} 连接重传不超过 1%，速度合格，优先保留更大缓冲区".format(streams)]
+        if not mode_goal(baseline, before, streams):
+            return ["{} 连接重传降至不超过 1%，速度合格".format(streams)]
         return []
-    gains = []
-    if (previous > RETRANS_TARGETS[streams][0] + METRIC_EPSILON
-            and previous - current > retrans_tolerance(previous) + METRIC_EPSILON):
-        gains.append("{} 连接估算重传比下降（{:.3f}% → {:.3f}%）".format(streams, previous, current))
-    if not mode_goal(baseline, before, streams) and mode_goal(baseline, after, streams):
-        gains.append("{} 连接达到优秀目标且速度合格".format(streams))
-    if mode_goal(baseline, after, streams):
-        previous_speed = median_metric(before, streams, "receiver_mbps")
-        current_speed = median_metric(after, streams, "receiver_mbps")
-        previous_samples = [row["receiver_mbps"] for row in before if row["streams"] == streams]
-        current_samples = [row["receiver_mbps"] for row in after if row["streams"] == streams]
-        # 中位数有足够提升且两组速度区间不重叠，才将提速计为收益。
-        if (current_speed + METRIC_EPSILON >= previous_speed * (1 + SPEED_GAIN_MIN)
-                and min(current_samples) > max(previous_samples) + METRIC_EPSILON):
-            gains.append("{} 连接稳定提速（{:.2f} → {:.2f} Mbps，提高 {:.2f}%），重传保持优秀".format(
-                streams, previous_speed, current_speed, (current_speed / previous_speed - 1) * 100))
-    return gains
+    # 高重传时只暂留下调后的明确改善，继续寻找重传合格的配置。
+    if after_max >= before_max or measurement_issues(before, streams):
+        return []
+    previous = median_metric(before, streams, "estimated_retrans_pct")
+    if previous - current > retrans_tolerance(previous) + METRIC_EPSILON:
+        return ["{} 连接估算重传比下降（{:.3f}% → {:.3f}%）".format(streams, previous, current)]
+    return []
 
 
 def restore_buffers(worker, state):
@@ -1490,7 +1486,8 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
     """持续试调未测上限；初值不稳定时以首个稳定候选建立比较参照。"""
     maximum, initial = state["net.ipv4.tcp_rmem"][2], state["net.ipv4.tcp_rmem"][1]
     check_buffer_target(state, maximum, initial)
-    if not BUFFER_MIN_BYTES <= maximum <= limit <= 256 * MIB:
+    minimum = max(state[key][0] for key in ("net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem"))
+    if not 1 <= minimum <= maximum <= limit <= BUFFER_MAX_BYTES:
         raise TaskError("初始缓冲区不在本机允许的试调范围内")
     streams = 1
     issues = measurement_issues(baseline, streams, check_stability=False)
@@ -1503,7 +1500,7 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
     measured = [row for row in measured if row["streams"] == streams]
     phase = {"phase": 1, "streams": streams, "status": "checking", "entry_measurements": measured}
     no_gain = 0
-    log("开始试调：重传优秀时上调 2 MiB，遇高重传后下调 1 MiB 微调")
+    log("开始试调：重传不超过 1% 时上调 2 MiB，最高 2.5 × BDP，遇高重传后下调 1 MiB 微调")
     atomic_json(trial_path, trials)
     visited = {maximum}
     direction = -1
@@ -1512,13 +1509,13 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
     refine_from = None
     step = (2 if high else 1) * MIB
     reason = "单连接{}，目标 ≤ {:.3f}%".format(
-        "高重传，优先下调" if high else "尚未满足优秀重传目标，优先下调", RETRANS_TARGETS[streams][0])
+        "高重传，优先下调" if high else "测速尚未稳定，优先下调", RETRANS_TARGETS[streams][1])
     if baseline is None:
         reason = "初值测速不稳定，先下调寻找稳定配置"
     while True:
         previous_max = state["net.ipv4.tcp_rmem"][2]
         growing = (not measurement_issues(measured, streams)
-                   and median_metric(measured, streams, "estimated_retrans_pct") <= RETRANS_TARGETS[streams][0] + METRIC_EPSILON)
+                   and median_metric(measured, streams, "estimated_retrans_pct") <= RETRANS_TARGETS[streams][1])
         reference_max = previous_max
         refining = False
         if growing:
@@ -1530,15 +1527,15 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
                 reason = "已触及高重传边界，按 1 MiB 下调微调"
                 next_target = next_buffer_refine_target(refine_from, previous_max, visited)
             else:
-                reason = "单连接重传优秀，按 2 MiB 上调试探提速"
+                reason = "单连接重传不高，按 2 MiB 上调试探更大缓冲区"
                 next_target = next_buffer_growth_target(previous_max, limit, visited)
         else:
-            next_target = next_buffer_target(previous_max, limit, direction, step, visited)
+            next_target = next_buffer_target(previous_max, limit, direction, step, visited, minimum)
         if next_target is None:
             if refining:
                 stop_reason = "高重传边界的 1 MiB 微调已完成，没有高于保留配置的未测候选"
             elif growing:
-                stop_reason = "单连接重传优秀，已达本机试调上限或更高候选均已测过"
+                stop_reason = "已达 2.5 × BDP 试调上限或更高候选均已测过"
             else:
                 stop_reason = "单连接可调范围内的候选均已测过"
             break
@@ -1583,9 +1580,11 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
                     log("已建立稳定测速参照：" + describe_measurements(rows))
                 else:
                     reasons.extend(speed_issues(baseline, rows, streams))
-                    gains = buffer_improvement(baseline, measured, rows, streams) if not reasons else []
+                    gains = buffer_improvement(baseline, measured, rows, streams, previous_max, target) if not reasons else []
+                if target > previous_max and median_metric(rows, streams, "estimated_retrans_pct") > RETRANS_TARGETS[streams][1]:
+                    reasons.append("单连接估算重传比超过 1%，不保留更大缓冲区")
             kept = bool(gains) and not reasons
-            reasons = reasons or gains or ["未确认重传改善或稳定提速，不把测速波动当作收益"]
+            reasons = reasons or gains or ["未取得重传改善或符合条件的更大缓冲区"]
             for row in rows:
                 row["decision"] = ("已保留" if kept else "已回退") + "：" + "；".join(reasons)
             trial.update(kept=kept, reasons=reasons, no_gain_rounds=0 if kept else no_gain + 1,
@@ -1612,7 +1611,7 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
             state, measured = candidate, rows
             log("本轮暂留：{}；单连接，收发上限 {} → {}".format(
                 "；".join(reasons), format_mib(previous_max), format_mib(target)))
-            reason = "单连接继续细调重传，优秀后上调试探提速"
+            reason = "单连接继续细调重传，重传不高后上调试探更大缓冲区"
         else:
             no_gain += 1
             log("本轮回退：{}；单连接，收发上限 {} → {}；连续无收益 {} 轮，继续试调".format(
@@ -1630,9 +1629,9 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
                  stop_reason=stop_reason)
     if search is not None:
         search.update(rounds=len(trials), speed_reference_round=reference_round,
-                      speed_tolerance=SPEED_TOLERANCE, speed_gain_min=SPEED_GAIN_MIN,
+                      speed_tolerance=SPEED_TOLERANCE, prefer_larger=True,
                       growth_step_bytes=BUFFER_GROW_STEP, refine_step_bytes=BUFFER_MIN_STEP,
-                      order=[streams], phases=[phase], min_bytes=BUFFER_MIN_BYTES,
+                      order=[streams], phases=[phase], min_bytes=minimum,
                       retrans_targets={str(streams): {"excellent": RETRANS_TARGETS[streams][0], "high": RETRANS_TARGETS[streams][1]}},
                       stop_reason=stop_reason)
     if trials:
@@ -2205,14 +2204,15 @@ def run_prepared_task(args, reservations):
         log("空载延迟 {} ms（{}）".format(rtt, "实测" if idle else "默认估值"))
         bdp, maximum, initial, limit = map(int, worker.run("buffer-plan", args.role, reference, rtt, quiet=True)[0].split())
         result["buffer_plan"] = {"bdp_bytes": bdp, "max_bytes": maximum, "default_bytes": initial,
-                                 "min_bytes": BUFFER_MIN_BYTES, "limit_bytes": limit}
-        log("BDP {}，初始收发上限 {}".format(format_mib(bdp), format_mib(maximum)))
+                                 "limit_bytes": limit}
+        log("BDP {}，初始收发上限 {}，试调上限 {}".format(format_mib(bdp), format_mib(maximum), format_mib(limit)))
         tune_args = ["--role", args.role, "--bw", str(reference), "--rtt", str(rtt)]
         if reference <= 100:
             tune_args.append("--no-initcwnd")
         worker.run("tune", *tune_args)
         current_buffers = read_buffers(worker)
         check_buffer_target(current_buffers, maximum, initial)
+        result["buffer_plan"]["min_bytes"] = max(current_buffers[key][0] for key in ("net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem"))
         result["buffers_derived"] = current_buffers
         log("已应用初值：" + describe_buffers(current_buffers))
         result["initial_after"] = measure_group("初值测速")
@@ -2316,7 +2316,7 @@ def run_prepared_task(args, reservations):
         result["recommended_config"] = recommendation
         goal_reasons = []
         if not mode_goal(speed_reference, result["final"], 1):
-            goal_reasons.append("单连接未达到稳定的优秀重传目标和速度要求")
+            goal_reasons.append("单连接未达到重传不超过 1%、测速稳定和速度保护要求")
         result["goal_reasons"] = goal_reasons
         result["recommended_validation"] = "通过" if kept else "已恢复原配置"
         result["recommended_measurements"] = result["final"]
@@ -2328,7 +2328,7 @@ def run_prepared_task(args, reservations):
                                            for group in groups]
         result["recommended_number"] = next(group["number"] for group in groups if recommendation in group["config_ids"])
         if goal_reasons:
-            log("单连接重传尚未达到优秀目标")
+            log("单连接尚未达到重传、稳定性或速度要求")
         coordinator.finished = "OK 测速已结束，请在调优端选择保存配置"
         selected, number = select_configuration(book, recommendation, args.yes, check=coordinator.check)
         result.update(selected_config=selected, selected_number=number or result["recommended_number"],

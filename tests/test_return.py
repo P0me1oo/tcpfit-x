@@ -216,10 +216,17 @@ class DecisionTests(unittest.TestCase):
         after[1]["estimated_retrans_pct"] = 0.4
         self.assertFalse(MODULE.base_decision(self.worker, before, after)[0])
 
-    def test_material_retrans_increase_is_rejected_even_within_the_same_band(self):
+    def test_retrans_increase_below_one_percent_is_accepted(self):
         before = self.rows([100] * 3, [200] * 3, 0.1)
         after = self.rows([120] * 3, [240] * 3, 0.3)
-        self.assertFalse(MODULE.base_decision(self.worker, before, after)[0])
+        self.assertTrue(MODULE.base_decision(self.worker, before, after)[0])
+
+    def test_final_acceptance_rejects_high_retransmission_even_after_improvement(self):
+        before = self.rows([100] * 3, [200] * 3, 6)
+        after = self.rows([100] * 3, [200] * 3, 1.2)
+        kept, reasons = MODULE.base_decision(self.worker, before, after)
+        self.assertFalse(kept)
+        self.assertIn("单连接估算重传比超过 1%", reasons)
 
     def test_raised_shaper_requires_original_throughput_band_and_stable_excess(self):
         reference = self.rows([600] * 3, [940] * 3)

@@ -36,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.15.0"
+VERSION="0.16.0"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -525,13 +525,13 @@ calc_tcp_mem(){
 
 # 基础调优默认初始缓冲区上限 = 1.5 × BDP + 2 MiB，再受本机内存范围约束。
 # 倍率用于初始估算，固定余量为窗口和内核记账留出空间；最终是否保留由实测决定。
-# 优化线路调优由协调模块改用 BDP + 2 MiB 和 6 MiB 下限；显示各自实际使用的公式。
+# 优化线路调优由协调模块改用 1.5×BDP 初值和 2.5×BDP 试调上限，无 MiB 下限。
 #
 # 常规上限为内存的 1/32，绝对上限 256 MiB。512 MiB 档允许试到收发各
 # 24 MiB；MemTotal 至少 448 MiB 即归入此档，容纳内核保留内存造成的差额。
 # 更小的机器仍按原比例限制，超过此档后上限不下降；tcp_mem 总预算保持不变。
 #
-# 上限不是预分配，也不保证高并发时没有内存压力；优化线路调优模式还会检查可用内存，
+# 上述内存范围用于普通基础调优；优化线路调优按 BDP 限制缓冲区，
 # 并用实际接收速度和重传决定是否保留候选。
 calc_buf_limit(){   # calc_buf_limit <内存MiB>
   awk -v m="$1" 'BEGIN{
@@ -653,13 +653,20 @@ read_buffer_config(){
   done
 }
 
-format_mib(){ awk -v bytes="$1" 'BEGIN{v=bytes/1048576; if(v==int(v))printf "%.0f MiB",v; else printf "%.2f MiB",v}'; }
+format_mib(){
+  awk -v bytes="$1" 'BEGIN{
+    if(bytes<1024){printf "%.0f 字节",bytes; exit}
+    if(bytes<1048576){printf "%.2f KiB",bytes/1024; exit}
+    v=bytes/1048576
+    if(v==int(v))printf "%.0f MiB",v; else printf "%.2f MiB",v
+  }'
+}
 
 # 只更新六项缓冲区参数。子 shell 独立管理中断与失败恢复，不覆盖调用者的 trap。
 apply_buffer_config(){ (
   local maximum="$1" initial="${2:-}" previous key value chosen minimum actual
   local keys=() old=() next=() parts=() index candidate="" backup="" touched=0 persisted=0 committed=0 restore_log_fd
-  is_posint "$maximum" 1 1073741824 || { warn "缓冲区上限必须在 1-1073741824 字节之间"; return 1; }
+  is_posint "$maximum" 1 2147483647 || { warn "缓冲区上限必须在 1-2147483647 字节之间"; return 1; }
   maximum=$((10#$maximum))
   if [ -n "$initial" ]; then
     is_posint "$initial" 1 "$maximum" || { warn "缓冲区默认值不能超过上限"; return 1; }
@@ -1636,14 +1643,17 @@ cmd_tune(){
 
   take_snapshot
 
-  local bdp buf_max buf_def tcp_mem
-  local buf_limit
-  read -r bdp buf_max buf_def buf_limit < <(calc_buffer_profile "$role" "$bw" "$rtt" "$ram")
+  local bdp buf_max buf_def buf_min tcp_mem
+  local buf_limit buffer_profile
+  buffer_profile=$(calc_buffer_profile "$role" "$bw" "$rtt" "$ram") || die "缓冲区推导失败，未应用调优参数"
+  read -r bdp buf_max buf_def buf_limit <<<"$buffer_profile"
+  buf_min=4096
+  [ "$buf_min" -le "$buf_def" ] || buf_min="$buf_def"
   tcp_mem=$(calc_tcp_mem "$ram")
 
   info "Derived from: ${bw} Mbps / RTT ${rtt} ms / ${ram} MB RAM / role $role"
-  kv "  BDP"            "$(awk -v v="$bdp" 'BEGIN{printf "%.1f MB", v/1048576}')"
-  kv "  Buffer max"     "$(awk -v v="$buf_max" 'BEGIN{printf "%.0f MB", v/1048576}')  ($(buf_max_reason "$bdp" "$ram" "$buf_max"))"
+  kv "  BDP"            "$(format_mib "$bdp")"
+  kv "  Buffer max"     "$(format_mib "$buf_max")  ($(buf_max_reason "$bdp" "$ram" "$buf_max"))"
   kv "  tcp_mem"        "$(echo "$tcp_mem" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024, $2*4/1024, $3*4/1024}')  (RAM 1/16, 1/8, 1/4)"
 
   modprobe tcp_bbr 2>/dev/null
@@ -1665,8 +1675,8 @@ net.core.rmem_max = $buf_max
 net.core.wmem_max = $buf_max
 net.core.rmem_default = $buf_def
 net.core.wmem_default = $buf_def
-net.ipv4.tcp_rmem = 4096 $buf_def $buf_max
-net.ipv4.tcp_wmem = 4096 $buf_def $buf_max
+net.ipv4.tcp_rmem = $buf_min $buf_def $buf_max
+net.ipv4.tcp_wmem = $buf_min $buf_def $buf_max
 # 全局 TCP 内存上限, 按物理内存推导. 设太高是小内存机 OOM 的主因.
 net.ipv4.tcp_mem = $tcp_mem
 
@@ -3125,7 +3135,7 @@ cmd_return(){
   _conf "接入 / 测速端口" "$control_display / $iperf_display TCP"
   _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
   _conf "测试方式" "单连接，每组 $repeats 次"
-  _conf "缓冲区试调" "BDP + 2 MiB 起步，初值不稳定继续试调，不限轮数和总时长"
+  _conf "缓冲区试调" "1.5 × BDP 起步，最高 2.5 × BDP，初值不稳定继续试调，不限轮数和总时长"
   if [ -n "$server_bw" ] || [ -n "$client_bw" ]; then
     _conf "带宽参考" "取已填标称带宽的较小值，不额外探测"
   else
