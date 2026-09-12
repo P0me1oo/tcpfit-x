@@ -36,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.14.0"
+VERSION="0.15.0"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -3125,7 +3125,7 @@ cmd_return(){
   _conf "接入 / 测速端口" "$control_display / $iperf_display TCP"
   _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
   _conf "测试方式" "单连接，每组 $repeats 次"
-  _conf "缓冲区试调" "BDP + 2 MiB 起步，最多 8 轮，连续 3 轮无收益停止"
+  _conf "缓冲区试调" "BDP + 2 MiB 起步，初值不稳定继续试调，不限轮数和总时长"
   if [ -n "$server_bw" ] || [ -n "$client_bw" ]; then
     _conf "带宽参考" "取已填标称带宽的较小值，不额外探测"
   else
@@ -3424,7 +3424,7 @@ banner(){
   _sep
   _row "   0. Exit"
   _item 1 "国际线路调优" "International tuning"   "~10 min"
-  _item 2 "优化线路调优" "Optimized route tuning"        "up to 30 min"
+  _item 2 "优化线路调优" "Optimized route tuning"
   _item 3 "基础调优" "Base tuning only"          "~1 min"
   _item 4 "拐点测试" "Policer sweep"             "~8 min"
   _item 5 "加 swap"  "Add swap (low-memory box)"

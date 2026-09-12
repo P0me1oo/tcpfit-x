@@ -174,6 +174,10 @@ class ReturnEntryTests(unittest.TestCase):
         self.assertIn("<--yes>", default.stdout)
         self.assertIn("单连接，每组 2 次", default.stdout)
         self.assertIn("BDP + 2 MiB 起步", default.stdout)
+        self.assertIn("初值不稳定继续试调", default.stdout)
+        self.assertIn("不限轮数和总时长", default.stdout)
+        self.assertNotIn("最多 8 轮", default.stdout)
+        self.assertNotIn("连续 3 轮无收益停止", default.stdout)
         self.assertNotIn("独立复测", default.stdout)
         self.assertNotIn("分两阶段", default.stdout)
         custom = self.run_return("--yes", "--repeats", "5")
@@ -255,6 +259,7 @@ banner
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         numbers = re.findall(r"^│\s+(\d+)\.", result.stdout, re.MULTILINE)
         self.assertEqual(numbers, [str(number) for number in range(12)])
+        self.assertNotIn("up to 30 min", result.stdout)
 
     def test_each_numeric_choice_runs_its_intended_action(self):
         actions = [None, "wizard", "cmd_return", "cmd_tune", "cmd_sweep", "cmd_harden", "cmd_status",

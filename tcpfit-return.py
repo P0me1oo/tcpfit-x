@@ -26,11 +26,9 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 MIB = 1048576
 BUFFER_MIN_BYTES = 6 * MIB
-BUFFER_TRIALS = 8
-BUFFER_NO_GAIN_LIMIT = 3
 BUFFER_MIN_STEP = MIB
 BUFFER_GROW_STEP = 2 * MIB
 SPEED_TOLERANCE = 0.05
@@ -45,7 +43,6 @@ BUFFER_KEYS = (
 )
 MAX_BODY = 2 * 1024 * 1024
 HEARTBEAT_TIMEOUT = 45
-TASK_TIMEOUT = 1800
 CONFIG_FILES = (
     "/etc/sysctl.d/99-tcpfit.conf",
     "/usr/local/sbin/tcpfit-qdisc.sh",
@@ -879,7 +876,6 @@ class Coordinator:
         self.session = None
         self.peer = None
         self.expires = time.monotonic() + args.token_ttl
-        self.started = time.monotonic()
         self.last_seen = None
         self.error = None
         self.finished = None
@@ -908,8 +904,6 @@ class Coordinator:
         if process_stamp(self.owner_parent) != self.parent_stamp:
             raise TaskError("调优入口进程已退出，正在恢复配置")
         now = time.monotonic()
-        if now - self.started > TASK_TIMEOUT:
-            raise TaskError("任务超过 30 分钟，已停止测速")
         if self.peer and self.finished is None and now - self.last_seen > HEARTBEAT_TIMEOUT:
             raise TaskError("测速端连接中断：45 秒内未收到心跳")
         if not self.peer and now > self.expires:
@@ -1276,7 +1270,7 @@ def retrans_tolerance(baseline):
     return max(0.01, min(0.1, baseline * 0.2))
 
 
-def measurement_issues(results, streams, repeats=None):
+def measurement_issues(results, streams, repeats=None, *, check_stability=True):
     group = [row for row in results if row.get("streams") == streams]
     expected = repeats if repeats is not None else max([row.get("repeats", 2) for row in group] or [2])
     if len(group) < expected or any(row.get("status", "valid") != "valid" for row in group):
@@ -1288,6 +1282,8 @@ def measurement_issues(results, streams, repeats=None):
         retrans = [positive(row.get("estimated_retrans_pct"), "估算重传比", True) for row in group]
     except TaskError as error:
         return [str(error)]
+    if not check_stability:
+        return []
     reasons = []
     if max(speed) - min(speed) > statistics.median(speed) * SPEED_SPREAD + METRIC_EPSILON:
         reasons.append("{} 连接接收速度明显波动，不稳定".format(streams))
@@ -1297,9 +1293,11 @@ def measurement_issues(results, streams, repeats=None):
 
 
 def speed_issues(baseline, measured, streams):
+    if baseline is None:
+        return ["尚未取得稳定测速参照"]
     if median_metric(measured, streams, "receiver_mbps") + METRIC_EPSILON < (
             median_metric(baseline, streams, "receiver_mbps") * (1 - SPEED_TOLERANCE)):
-        return ["{} 连接速度比初值下降超过 5%".format(streams)]
+        return ["{} 连接速度比稳定参照下降超过 5%".format(streams)]
     return []
 
 
@@ -1324,6 +1322,8 @@ def retrans_acceptable(worker, before, after, tolerant=False, modes=(1,)):
 
 
 def base_decision(worker, before, after):
+    if before is None:
+        return False, ["未取得稳定测速参照，无法确认候选效果"]
     reasons = retrans_acceptable(worker, before, after, tolerant=True)
     if not measurement_issues(before, 1) and not measurement_issues(after, 1):
         reasons.extend(speed_issues(before, after, 1))
@@ -1407,7 +1407,7 @@ def describe_measurements(measured):
 
 
 def next_buffer_target(current, limit, direction, step, visited):
-    """优先沿当前方向缩步；邻点已试过时检查反向的 1 MiB 邻点。"""
+    """优先沿当前方向缩步；跳过已测上限继续向边界搜索，再尝试反向。"""
 
     for candidate_direction in (direction, -direction):
         candidate_step = step if candidate_direction == direction else BUFFER_MIN_STEP
@@ -1418,6 +1418,13 @@ def next_buffer_target(current, limit, direction, step, visited):
             if candidate_step <= BUFFER_MIN_STEP:
                 break
             candidate_step = max(BUFFER_MIN_STEP, candidate_step // 2)
+        target = min(limit, max(BUFFER_MIN_BYTES, current + candidate_direction * BUFFER_MIN_STEP))
+        while target != current:
+            if target not in visited:
+                return target, candidate_direction, abs(target - current)
+            if target in (BUFFER_MIN_BYTES, limit):
+                break
+            target = min(limit, max(BUFFER_MIN_BYTES, target + candidate_direction * BUFFER_MIN_STEP))
     return None
 
 
@@ -1479,16 +1486,20 @@ def restore_buffers(worker, state):
     return restored
 
 
-def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials, trial_path, search=None, can_trial=None):
-    """单连接重传优秀后继续试探提速；速度保护以初值测量为参照。"""
+def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials, trial_path, search=None):
+    """持续试调未测上限；初值不稳定时以首个稳定候选建立比较参照。"""
     maximum, initial = state["net.ipv4.tcp_rmem"][2], state["net.ipv4.tcp_rmem"][1]
     check_buffer_target(state, maximum, initial)
     if not BUFFER_MIN_BYTES <= maximum <= limit <= 256 * MIB:
         raise TaskError("初始缓冲区不在本机允许的试调范围内")
     streams = 1
-    issues = measurement_issues(baseline, streams)
+    issues = measurement_issues(baseline, streams, check_stability=False)
     if issues:
-        raise TaskError("初值测速不能用于速度比较：" + "；".join(issues))
+        raise TaskError("初值测速数据无效：" + "；".join(issues))
+    reference_round = 0
+    if measurement_issues(baseline, streams):
+        log("初值测速不稳定，继续试调；取得稳定结果后再建立比较参照")
+        baseline, reference_round = None, None
     measured = [row for row in measured if row["streams"] == streams]
     phase = {"phase": 1, "streams": streams, "status": "checking", "entry_measurements": measured}
     no_gain = 0
@@ -1502,15 +1513,12 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
     step = (2 if high else 1) * MIB
     reason = "单连接{}，目标 ≤ {:.3f}%".format(
         "高重传，优先下调" if high else "尚未满足优秀重传目标，优先下调", RETRANS_TARGETS[streams][0])
+    if baseline is None:
+        reason = "初值测速不稳定，先下调寻找稳定配置"
     while True:
-        if len(trials) >= BUFFER_TRIALS:
-            stop_reason = "达到最大 {} 轮".format(BUFFER_TRIALS)
-            break
-        if can_trial is not None and not can_trial():
-            stop_reason = "任务剩余时间需留给队列验证和保存配置"
-            break
         previous_max = state["net.ipv4.tcp_rmem"][2]
-        growing = median_metric(measured, streams, "estimated_retrans_pct") <= RETRANS_TARGETS[streams][0] + METRIC_EPSILON
+        growing = (not measurement_issues(measured, streams)
+                   and median_metric(measured, streams, "estimated_retrans_pct") <= RETRANS_TARGETS[streams][0] + METRIC_EPSILON)
         reference_max = previous_max
         refining = False
         if growing:
@@ -1532,7 +1540,7 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
             elif growing:
                 stop_reason = "单连接重传优秀，已达本机试调上限或更高候选均已测过"
             else:
-                stop_reason = "单连接达到边界或两侧最小步长候选均已测过"
+                stop_reason = "单连接可调范围内的候选均已测过"
             break
         target, next_direction, actual_step = next_target
         if not growing and next_direction != direction:
@@ -1541,8 +1549,8 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
         visited.add(target)
         index = len(trials) + 1
         action = "上调" if direction > 0 else "下调"
-        log("第 {}/{} 轮，单连接：{}；{}{} {} → {}，步长 {}".format(
-            index, BUFFER_TRIALS, reason, action, "候选上限" if refining else "收发上限",
+        log("第 {} 轮，单连接：{}；{}{} {} → {}，步长 {}".format(
+            index, reason, action, "候选上限" if refining else "收发上限",
             format_mib(reference_max), format_mib(target), format_mib(step)))
         log("保留配置：" + describe_measurements(measured))
         trial = {"round": index, "phase": 1, "streams": streams, "reason": reason,
@@ -1559,12 +1567,23 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
             rows = measure_group("单连接试调第 {} 轮".format(index), modes=(streams,))
             trial["measurements"] = rows
             log("候选结果：" + describe_measurements(rows))
+            invalid = measurement_issues(rows, streams, check_stability=False)
+            if invalid:
+                raise TaskError("候选测速数据无效：" + "；".join(invalid))
             reasons = measurement_issues(rows, streams)
+            gains = []
             if not reasons:
                 if median_metric(rows, streams, "estimated_retrans_pct") > RETRANS_TARGETS[streams][1]:
                     high_targets.add(target)
-                reasons.extend(speed_issues(baseline, rows, streams))
-            gains = buffer_improvement(baseline, measured, rows, streams) if not reasons else []
+                if baseline is None:
+                    # 首次稳定结果只建立参照，不声称相对不稳定初值提速或降低重传。
+                    baseline, reference_round = rows, index
+                    trial["established_reference"] = True
+                    gains = ["首次取得稳定测速，暂留并作为后续比较参照"]
+                    log("已建立稳定测速参照：" + describe_measurements(rows))
+                else:
+                    reasons.extend(speed_issues(baseline, rows, streams))
+                    gains = buffer_improvement(baseline, measured, rows, streams) if not reasons else []
             kept = bool(gains) and not reasons
             reasons = reasons or gains or ["未确认重传改善或稳定提速，不把测速波动当作收益"]
             for row in rows:
@@ -1596,11 +1615,8 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
             reason = "单连接继续细调重传，优秀后上调试探提速"
         else:
             no_gain += 1
-            log("本轮回退：{}；单连接，收发上限 {} → {}；连续无收益 {}/{}".format(
-                "；".join(reasons), format_mib(target), format_mib(previous_max), no_gain, BUFFER_NO_GAIN_LIMIT))
-            if no_gain >= BUFFER_NO_GAIN_LIMIT:
-                stop_reason = "连续 {} 轮无收益".format(no_gain)
-                break
+            log("本轮回退：{}；单连接，收发上限 {} → {}；连续无收益 {} 轮，继续试调".format(
+                "；".join(reasons), format_mib(target), format_mib(previous_max), no_gain))
             if growing:
                 direction, step = 1, BUFFER_GROW_STEP
             elif step > BUFFER_MIN_STEP:
@@ -1613,7 +1629,7 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
     phase.update(status="completed" if reached else "stopped", goal_reached=reached, measurements=measured,
                  stop_reason=stop_reason)
     if search is not None:
-        search.update(max_rounds=BUFFER_TRIALS, no_gain_limit=BUFFER_NO_GAIN_LIMIT, rounds=len(trials),
+        search.update(rounds=len(trials), speed_reference_round=reference_round,
                       speed_tolerance=SPEED_TOLERANCE, speed_gain_min=SPEED_GAIN_MIN,
                       growth_step_bytes=BUFFER_GROW_STEP, refine_step_bytes=BUFFER_MIN_STEP,
                       order=[streams], phases=[phase], min_bytes=BUFFER_MIN_BYTES,
@@ -1623,7 +1639,7 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
         trials[-1]["search_stop_reason"] = stop_reason
     atomic_json(trial_path, trials)
     log("缓冲区试调停止：{}；当前 {}".format(stop_reason, describe_buffers(state)))
-    return measured, state
+    return measured, state, baseline
 
 
 def shape_candidate(worker, old_rate, results):
@@ -1723,11 +1739,6 @@ class MeasurementBook:
 
     def save(self):
         atomic_json(self.record_dir / "measurement-index.json", self.records)
-
-    def can_trial(self):
-        # 为本轮、已有整形的四连接检查和队列变化后的复测留时间。
-        required = self.repeats * (self.duration + 20) * 5
-        return time.monotonic() + required < self.coordinator.started + TASK_TIMEOUT
 
     def measure_group(self, stage, modes=(1,), repeats=None):
         repeats = self.repeats if repeats is None else repeats
@@ -2205,17 +2216,18 @@ def run_prepared_task(args, reservations):
         result["buffers_derived"] = current_buffers
         log("已应用初值：" + describe_buffers(current_buffers))
         result["initial_after"] = measure_group("初值测速")
-        issues = measurement_issues(result["initial_after"], 1)
-        if issues:
-            raise TaskError("初值测速不能用于速度比较：" + "；".join(issues))
-        result["speed_reference"] = "initial_after"
         result["buffer_trials"] = []
         result["buffer_search"] = {}
-        result["stage_measurements"], result["buffers_selected"] = tune_buffers(
+        result["stage_measurements"], result["buffers_selected"], speed_reference = tune_buffers(
             worker, result["initial_after"], result["initial_after"], current_buffers, limit,
-            measure_group, result["buffer_trials"], record_dir / "buffer-trials.json", result["buffer_search"], book.can_trial)
+            measure_group, result["buffer_trials"], record_dir / "buffer-trials.json", result["buffer_search"])
+        result["speed_reference"] = None
+        if speed_reference is not None:
+            result["speed_reference"] = "initial_after" if result["buffer_search"]["speed_reference_round"] == 0 else "first_stable_after"
+            if result["speed_reference"] == "first_stable_after":
+                result["first_stable_after"] = speed_reference
         result["after"] = result["stage_measurements"]
-        kept, reasons = base_decision(worker, result["initial_after"], result["after"])
+        kept, reasons = base_decision(worker, speed_reference, result["after"])
         result.update(base_kept=kept, base_reasons=reasons)
         for row in result["after"]:
             row["decision"] = ("已保留" if kept else "已回退") + "：" + "；".join(reasons)
@@ -2284,7 +2296,7 @@ def run_prepared_task(args, reservations):
                     result["shape_reason"] = "最终验证未通过，恢复原整形：" + "；".join(final_reasons)
                     result["final"] = measure_group("恢复原整形后验证")
         coordinator.check()
-        final_ok, final_reasons = base_decision(worker, result["initial_after"], result["final"])
+        final_ok, final_reasons = base_decision(worker, speed_reference, result["final"])
         for row in result["final"]:
             row["decision"] = ("通过" if final_ok else "已回退") + "：" + "；".join(final_reasons)
         if not final_ok and (kept or result["final_rate"] != old_rate):
@@ -2303,7 +2315,7 @@ def run_prepared_task(args, reservations):
         recommendation = book.register(final_state)
         result["recommended_config"] = recommendation
         goal_reasons = []
-        if not mode_goal(result["initial_after"], result["final"], 1):
+        if not mode_goal(speed_reference, result["final"], 1):
             goal_reasons.append("单连接未达到稳定的优秀重传目标和速度要求")
         result["goal_reasons"] = goal_reasons
         result["recommended_validation"] = "通过" if kept else "已恢复原配置"

@@ -62,7 +62,7 @@ class BufferWorker:
 
 
 class BufferTrialTests(unittest.TestCase):
-    def search(self, initial_rows, candidates, *, state=None, baseline=None, limit=64, rounds=8, can_trial=None):
+    def search(self, initial_rows, candidates, *, state=None, baseline=None, limit=64, rounds=None):
         worker = BufferWorker(state or buffer_state())
         pending, stages, trials, search = list(candidates), [], [], {}
         output = io.StringIO()
@@ -75,28 +75,39 @@ class BufferTrialTests(unittest.TestCase):
             self.assertEqual(expected_mode, 1)
             return [row for row in group if row["streams"] == expected_mode]
 
-        with tempfile.TemporaryDirectory() as directory, redirect_stdout(output), \
-                mock.patch.object(MODULE, "BUFFER_TRIALS", rounds):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(output), ExitStack() as stack:
+            if rounds is not None:
+                # 单轮判定用例限定候选数量；完整搜索用例始终使用真实规划函数。
+                for name in ("next_buffer_target", "next_buffer_growth_target", "next_buffer_refine_target"):
+                    planner = getattr(MODULE, name)
+                    stack.enter_context(mock.patch.object(
+                        MODULE, name, side_effect=lambda *args, planner=planner:
+                        planner(*args) if len(trials) < rounds else None))
             path = Path(directory) / "buffer-trials.json"
-            chosen_rows, chosen_state = MODULE.tune_buffers(
+            chosen_rows, chosen_state, reference = MODULE.tune_buffers(
                 worker, baseline or [row for row in initial_rows if row["streams"] == 1], initial_rows,
                 copy.deepcopy(worker.state), limit * MIB,
-                measure, trials, path, search, can_trial)
+                measure, trials, path, search)
             saved = json.loads(path.read_text(encoding="utf-8"))
+        if reference is not None:
+            self.assertFalse(MODULE.measurement_issues(reference, 1))
         self.assertEqual(saved, trials)
         self.assertEqual(worker.state, chosen_state)
         self.assertFalse(pending, "应完成预期的候选验证")
         return worker, chosen_rows, chosen_state, trials, stages, output.getvalue(), search
 
-    def test_good_single_connection_keeps_growing_until_three_rounds_without_gain(self):
+    def test_growth_finds_later_gain_after_three_rejections_and_continues_past_eight_rounds(self):
         worker, _, state, trials, stages, output, search = self.search(rows(retrans=0), [
-            (1, rows(single=speed, retrans=0)) for speed in (110, 120, 120, 119, 120)])
-        self.assertEqual([trial["target_max_bytes"] for trial in trials], [value * MIB for value in (18, 20, 22, 24, 26)])
-        self.assertEqual([trial["kept"] for trial in trials], [True, True, False, False, False])
-        self.assertEqual(state, buffer_state(20))
+            (1, rows(single=speed, retrans=0)) for speed in (110, 120, 120, 119, 120, 130, 130, 129, 130, 130)], limit=36)
+        self.assertEqual([trial["target_max_bytes"] for trial in trials], [value * MIB for value in range(18, 37, 2)])
+        self.assertEqual([trial["kept"] for trial in trials], [True, True, False, False, False, True, False, False, False, False])
+        self.assertEqual(state, buffer_state(28))
         self.assertTrue(all(modes == (1,) for _, modes, _ in stages))
         self.assertIn("稳定提速", output)
-        self.assertIn("连续 3 轮无收益", output)
+        self.assertIn("连续无收益 4 轮，继续试调", output)
+        self.assertIn("已达本机试调上限", search["stop_reason"])
+        self.assertNotIn("max_rounds", search)
+        self.assertNotIn("no_gain_limit", search)
         self.assertEqual(search["order"], [1])
         self.assertEqual(len(search["phases"]), 1)
         self.assertTrue(all(phase["goal_reached"] for phase in search["phases"]))
@@ -236,15 +247,17 @@ class BufferTrialTests(unittest.TestCase):
         self.assertEqual(trials[-1]["refine_from_max_bytes"], 23 * MIB)
         self.assertEqual(trials[-1]["no_gain_rounds"], 0)
 
-    def test_eight_round_limit_applies_to_single_connection(self):
-        initial = rows(retrans=40)
-        candidates = [(1, rows(retrans=40 - step * 4)) for step in range(1, 9)]
-        worker, _, _, trials, _, output, search = self.search(initial, candidates, state=buffer_state(32))
-        self.assertEqual(len(trials), 8)
-        self.assertEqual(search["phases"][0]["status"], "stopped")
+    def test_stable_improvements_continue_past_eight_rounds_until_the_ceiling(self):
+        initial = rows(retrans=0)
+        candidates = [(1, rows(single=100 + step * 5, retrans=0)) for step in range(1, 13)]
+        worker, _, state, trials, _, output, search = self.search(initial, candidates, limit=40)
+        self.assertEqual(len(trials), 12)
+        self.assertTrue(all(trial["kept"] for trial in trials))
+        self.assertEqual(state, buffer_state(40))
+        self.assertEqual(search["phases"][0]["status"], "completed")
         self.assertEqual(len(search["phases"]), 1)
-        self.assertIn("达到最大 8 轮", output)
-        self.assertEqual([item[0] for item in worker.changes], [value * MIB for value in range(30, 15, -2)])
+        self.assertIn("第 12 轮", output)
+        self.assertEqual([item[0] for item in worker.changes], [value * MIB for value in range(18, 41, 2)])
 
     def test_coarse_rejection_rolls_back_then_shrinks_step(self):
         worker, _, state, trials, _, output, _ = self.search(rows(retrans=6), [
@@ -256,14 +269,16 @@ class BufferTrialTests(unittest.TestCase):
         self.assertEqual(state, buffer_state(15))
         self.assertIn("回退后缩小步长", output)
 
-    def test_three_no_gain_rounds_stop_after_reverse_fine_tuning(self):
+    def test_no_gain_search_continues_beyond_immediate_neighbors(self):
         initial = rows(retrans=6)
-        worker, _, state, trials, _, output, _ = self.search(initial, [(1, initial)] * 3)
-        self.assertEqual([trial["target_max_bytes"] for trial in trials], [14 * MIB, 15 * MIB, 17 * MIB])
+        worker, _, state, trials, _, output, search = self.search(
+            initial, [(1, initial)] * 4, state=buffer_state(8), limit=10)
+        self.assertEqual([trial["target_max_bytes"] for trial in trials], [value * MIB for value in (6, 7, 9, 10)])
         self.assertTrue(all(not trial["kept"] for trial in trials))
-        self.assertEqual(state, buffer_state())
+        self.assertEqual(state, buffer_state(8))
         self.assertIn("反向细调", output)
-        self.assertIn("连续 3 轮无收益", output)
+        self.assertEqual(trials[-1]["no_gain_rounds"], 4)
+        self.assertIn("可调范围内的候选均已测过", search["stop_reason"])
 
     def test_small_successive_speed_losses_cannot_accumulate_below_initial_reference(self):
         initial = rows(retrans=6)
@@ -273,7 +288,7 @@ class BufferTrialTests(unittest.TestCase):
         ], rounds=2)
         self.assertEqual([trial["kept"] for trial in trials], [True, False])
         self.assertEqual(state, buffer_state(14))
-        self.assertIn("比初值下降超过 5%", output)
+        self.assertIn("比稳定参照下降超过 5%", output)
 
     def test_single_connection_speed_regression_rejects_retransmission_gain(self):
         _, _, state, trials, _, _, _ = self.search(rows(retrans=6), [
@@ -296,11 +311,56 @@ class BufferTrialTests(unittest.TestCase):
         self.assertEqual(worker.changes, [(6 * MIB, 6 * MIB), (8 * MIB, 8 * MIB)])
         self.assertEqual(state, buffer_state(8, 8))
 
-    def test_time_reserve_stops_trials_before_mutation(self):
-        worker, _, _, trials, _, output, _ = self.search(rows(retrans=6), [], can_trial=lambda: False)
-        self.assertFalse(worker.changes)
-        self.assertFalse(trials)
-        self.assertIn("剩余时间", output)
+    def test_unstable_initial_values_establish_a_fixed_reference_at_the_first_stable_candidate(self):
+        initial = rows(retrans=0)
+        initial[0].update(receiver_mbps=608.43, estimated_retrans_pct=0)
+        initial[1].update(receiver_mbps=405.65, estimated_retrans_pct=5.366)
+        worker, measured, state, trials, _, output, search = self.search(initial, [
+            (1, rows(single=500, retrans=3)),
+            (1, rows(single=476, retrans=0.4)),
+            (1, rows(single=453, retrans=0.4)),
+        ])
+        self.assertEqual([trial["target_max_bytes"] for trial in trials], [value * MIB for value in (14, 12, 13)])
+        self.assertEqual([trial["kept"] for trial in trials], [True, True, False])
+        self.assertEqual(search["speed_reference_round"], 1)
+        self.assertTrue(trials[0]["established_reference"])
+        self.assertIn("首次取得稳定测速", trials[0]["reasons"][0])
+        self.assertNotIn("提速", trials[0]["reasons"][0])
+        self.assertEqual(state, buffer_state(12))
+        self.assertEqual(MODULE.median_metric(measured, 1, "receiver_mbps"), 476)
+        self.assertIn("比稳定参照下降超过 5%", output)
+
+    def test_unstable_candidates_continue_until_a_later_stable_result(self):
+        unstable = rows(retrans=0)
+        unstable[0]["receiver_mbps"] = 60
+        _, _, state, trials, _, _, search = self.search(unstable, [
+            (1, unstable), (1, unstable), (1, unstable), (1, rows(retrans=0)),
+        ], state=buffer_state(8), limit=10)
+        self.assertEqual([trial["target_max_bytes"] for trial in trials], [value * MIB for value in (7, 9, 6, 10)])
+        self.assertEqual([trial["kept"] for trial in trials], [False, False, False, True])
+        self.assertEqual(search["speed_reference_round"], 4)
+        self.assertEqual(state, buffer_state(10))
+
+    def test_invalid_initial_data_still_stops_before_applying_candidates(self):
+        for missing_field in ("receiver_mbps", "estimated_retrans_pct"):
+            with self.subTest(missing_field=missing_field):
+                initial = rows(retrans=6)
+                initial[0][missing_field] = None
+                with self.assertRaisesRegex(MODULE.TaskError, "初值测速数据无效"):
+                    self.search(initial, [])
+
+    def test_missing_candidate_data_still_fails_and_restores_the_previous_buffers(self):
+        candidate = [row for row in rows(retrans=0.1) if row["streams"] == 1]
+        candidate[0].pop("estimated_retrans_pct")
+        worker = BufferWorker(buffer_state())
+        trials = []
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(MODULE.TaskError, "候选测速数据无效"):
+                MODULE.tune_buffers(worker, rows(retrans=6), rows(retrans=6), buffer_state(), 20 * MIB,
+                                    mock.Mock(return_value=candidate), trials, Path(directory) / "trials.json")
+        self.assertEqual(worker.state, buffer_state())
+        self.assertEqual(trials[0]["status"], "failed")
+        self.assertEqual(trials[0]["restored"], buffer_state())
 
     def test_growth_can_find_gain_after_rejected_candidates(self):
         worker, _, state, trials, _, _, _ = self.search(rows(retrans=0), [
@@ -314,7 +374,8 @@ class BufferTrialTests(unittest.TestCase):
         visited = {16 * MIB, 18 * MIB, 20 * MIB}
         self.assertEqual(MODULE.next_buffer_target(18 * MIB, 24 * MIB, 1, 2 * MIB, visited), (19 * MIB, 1, MIB))
         visited.update({17 * MIB, 19 * MIB})
-        self.assertIsNone(MODULE.next_buffer_target(18 * MIB, 24 * MIB, 1, 2 * MIB, visited))
+        self.assertEqual(MODULE.next_buffer_target(18 * MIB, 24 * MIB, 1, 2 * MIB, visited), (21 * MIB, 1, 3 * MIB))
+        self.assertIsNone(MODULE.next_buffer_target(18 * MIB, 24 * MIB, 1, 2 * MIB, {value * MIB for value in range(6, 25)}))
         self.assertEqual(MODULE.next_buffer_target(6 * MIB, 8 * MIB, -1, MIB, {6 * MIB}), (7 * MIB, 1, MIB))
         self.assertEqual(MODULE.next_buffer_target(7 * MIB, 8 * MIB, -1, 2 * MIB, {7 * MIB}), (6 * MIB, -1, MIB))
         limit = 20 * MIB + MIB // 2
@@ -459,9 +520,12 @@ class ReturnBufferFlowTests(unittest.TestCase):
                       recovery_failure=False, recovery_mismatch=False, selection=None,
                       old_rate=None, shape_passes=True, server_bw=1000, client_bw=200,
                       probe_speeds=None, expected_error=None, excellent_initial=False, growth_high=False,
-                      initial_speeds=None, idle_means=(100, 100), final_regression=False, flow_rate=None):
+                      initial_speeds=None, initial_retrans=None, trial_speeds=None,
+                      idle_means=(100, 100), final_regression=False, flow_rate=None):
         probe_values = iter(probe_speeds) if probe_speeds is not None else None
         initial_values = iter(initial_speeds) if initial_speeds is not None else None
+        initial_ratios = iter(initial_retrans) if initial_retrans is not None else None
+        trial_values = itertools.cycle(trial_speeds) if trial_speeds is not None else None
         self.flow_actions = []
         flow_actions = self.flow_actions
         task_failed = failure is not None or expected_error is not None
@@ -509,8 +573,8 @@ class ReturnBufferFlowTests(unittest.TestCase):
                         if growth_high:
                             ratios[20] = (1.6, 0)
                     else:
-                        speed.update({value: (99, 205) for value in (15, 17, 18)})
-                        ratios.update({value: (0.3, 0.8) for value in (15, 17, 18)})
+                        speed.update({value: (99, 205) for value in range(6, 21) if value not in speed})
+                        ratios.update({value: (0.3, 0.8) for value in range(6, 21) if value not in ratios})
                     group = rows(*speed[maximum], retrans=ratios[maximum][0], four_retrans=ratios[maximum][1])
                     sample = next(row for row in group if row["streams"] == args[0])
                     if self.stage.startswith("路径带宽探测"):
@@ -519,6 +583,10 @@ class ReturnBufferFlowTests(unittest.TestCase):
                             sample["receiver_mbps"] = next(probe_values)
                     if self.stage.startswith("初值测速") and initial_values is not None:
                         sample["receiver_mbps"] = next(initial_values)
+                    if self.stage.startswith("初值测速") and initial_ratios is not None:
+                        sample["estimated_retrans_pct"] = next(initial_ratios)
+                    if "试调" in self.stage and trial_values is not None:
+                        sample["receiver_mbps"] = next(trial_values)
                     if maximum == 14 and not candidate_passes_reference and "试调" in self.stage and args[0] == 1:
                         sample["receiver_mbps"] = 90
                     if final_regression and self.stage.startswith("最终配置验证") and args[0] == 1:
@@ -626,7 +694,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
             incomplete = recovery_failure or recovery_mismatch
             self.assertEqual(bool(result.get("cleanup_complete")), not incomplete)
             self.assertEqual((task_dir / "state" / "return-pending.json").exists(), incomplete)
-            self.assertEqual(restore_call.call_count, int(task_failed or final_regression)
+            self.assertEqual(restore_call.call_count, int(task_failed or final_regression or result.get("base_kept") is False)
                              + (1 if selection is not None and result.get("selected_config") != result.get("recommended_config") else 0))
             if incomplete:
                 self.assertIn("recovery_error", result)
@@ -671,7 +739,8 @@ class ReturnBufferFlowTests(unittest.TestCase):
         self.assertEqual(result["reference_bandwidth"], 200)
         self.assertEqual(result["rtt_ms"], 100)
         self.assertIn("最终缓冲区：接收 14 MiB / 发送 14 MiB", output)
-        self.assertEqual(result["buffer_search"]["max_rounds"], 8)
+        self.assertNotIn("max_rounds", result["buffer_search"])
+        self.assertNotIn("no_gain_limit", result["buffer_search"])
         self.assertIn("停止原因", output)
         self.assertNotIn("起始值", output)
         self.assertNotIn("可用内存", output)
@@ -705,7 +774,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
         self.assertFalse(result["buffer_trials"][0]["kept"])
         self.assertEqual(result["buffers_final"], buffer_state(15))
         self.assertEqual(result["final"], result["after"])
-        self.assertIn("比初值下降超过 5%", output)
+        self.assertIn("比稳定参照下降超过 5%", output)
 
     def test_queue_change_still_validates_single_connection_and_rolls_back_regression(self):
         result, output = self.exercise_flow(True, old_rate=150, final_regression=True)
@@ -722,12 +791,47 @@ class ReturnBufferFlowTests(unittest.TestCase):
                 self.assertIn(source, result["rtt_source"])
                 self.assertEqual(next(entry for entry in self.flow_actions if entry[0] == "buffer-plan")[-1], expected)
 
-    def test_unstable_or_missing_initial_results_stop_and_restore_the_original_snapshot(self):
-        for speeds in ((100, 200), (100, None)):
-            with self.subTest(speeds=speeds):
-                result, _ = self.exercise_flow(True, initial_speeds=speeds, expected_error="初值测速不能用于速度比较")
-                self.assertNotIn("buffer_trials", result)
-                self.assertEqual(result["buffers_final"], buffer_state(8))
+    def test_unstable_initial_results_continue_and_save_using_the_first_stable_reference(self):
+        result, output = self.exercise_flow(
+            True, initial_speeds=(608.43, 405.65), initial_retrans=(0, 5.366))
+        self.assertTrue(result["base_kept"])
+        self.assertEqual(result["speed_reference"], "first_stable_after")
+        self.assertEqual(result["first_stable_after"], result["buffer_trials"][0]["measurements"])
+        self.assertEqual(result["buffer_search"]["speed_reference_round"], 1)
+        self.assertEqual(result["buffers_final"], buffer_state(14))
+        self.assertEqual(result["final"], result["after"])
+        self.assertIn("初值测速不稳定，继续试调", output)
+        self.assertFalse(any("未取得稳定测速参照" in reason for reason in result["base_reasons"]))
+
+    def test_missing_initial_results_still_stop_and_restore_the_original_snapshot(self):
+        result, _ = self.exercise_flow(True, initial_speeds=(100, None), expected_error="初值测速数据无效")
+        self.assertEqual(result["buffer_trials"], [])
+        self.assertEqual(result["buffers_final"], buffer_state(8))
+
+    def test_queue_revalidation_after_unstable_initial_values_uses_the_stable_reference(self):
+        for regression in (False, True):
+            with self.subTest(regression=regression):
+                result, output = self.exercise_flow(
+                    True, initial_speeds=(608.43, 405.65), initial_retrans=(0, 5.366),
+                    old_rate=150, final_regression=regression)
+                self.assertEqual(result["speed_reference"], "first_stable_after")
+                self.assertEqual(result["base_kept"], not regression)
+                self.assertEqual(result["buffers_final"], buffer_state(8 if regression else 14))
+                self.assertTrue(any(row["stage"] == "最终配置验证" for row in result["measurements"]))
+                if regression:
+                    self.assertTrue(any("比稳定参照下降超过 5%" in reason for reason in result["base_reasons"]))
+                else:
+                    self.assertEqual(result["recommended_validation"], "通过")
+
+    def test_unstable_results_throughout_exhaust_candidates_before_recommending_the_original_configuration(self):
+        result, output = self.exercise_flow(True, initial_speeds=(100, 200), trial_speeds=(99, 150))
+        self.assertFalse(result["base_kept"])
+        self.assertIsNone(result["speed_reference"])
+        self.assertGreater(len(result["buffer_trials"]), 8)
+        self.assertTrue(all(not trial["kept"] for trial in result["buffer_trials"]))
+        self.assertEqual(result["buffers_final"], buffer_state(8))
+        self.assertEqual(result["recommended_validation"], "已恢复原配置")
+        self.assertIn("可调范围内的候选均已测过", result["buffer_search"]["stop_reason"])
 
     def test_latency_failure_stops_before_applying_initial_values(self):
         result, _ = self.exercise_flow(True, MODULE.TaskError("延迟采集失败"), failure_action="latency")

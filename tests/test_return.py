@@ -123,6 +123,17 @@ class PairingTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.TaskError, "心跳"):
             self.coordinator.check()
 
+    def test_paired_task_keeps_running_after_thirty_minutes_while_heartbeat_is_active(self):
+        status, response = self.coordinator.pair("Pair " + self.token, "192.0.2.1", MODULE.VERSION)
+        self.assertEqual(status, 200)
+        later = time.monotonic() + 3600
+        with mock.patch.object(MODULE.time, "monotonic", return_value=later):
+            self.assertTrue(self.coordinator.authenticate("Bearer " + response[3:], "192.0.2.1"))
+            self.coordinator.check()
+            self.coordinator.last_seen -= MODULE.HEARTBEAT_TIMEOUT + 1
+            with self.assertRaisesRegex(MODULE.TaskError, "心跳"):
+                self.coordinator.check()
+
     def test_closed_task_cannot_pair_or_restart_a_test(self):
         self.coordinator.close()
         self.assertIsNone(self.coordinator.token)
