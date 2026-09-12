@@ -36,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.9.1"
+VERSION="0.11.0"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -525,7 +525,7 @@ calc_tcp_mem(){
 
 # 基础调优默认初始缓冲区上限 = 1.5 × BDP + 2 MiB，再受本机内存范围约束。
 # 倍率用于初始估算，固定余量为窗口和内核记账留出空间；最终是否保留由实测决定。
-# 优化线路调优由协调模块改用 2 × BDP；共用内存约束，显示各自实际使用的公式。
+# 优化线路调优由协调模块改用 BDP + 2 MiB 和 6 MiB 下限；显示各自实际使用的公式。
 #
 # 常规上限为内存的 1/32，绝对上限 256 MiB。512 MiB 档允许试到收发各
 # 24 MiB；MemTotal 至少 448 MiB 即归入此档，容纳内核保留内存造成的差额。
@@ -2172,7 +2172,7 @@ probe_bandwidth(){
   printf '%s' "$bw"
 }
 
-# 两种调优共用四连接探测与取整；队列的事务由各自入口负责。
+# 国际线路调优使用四连接探测与取整；优化线路调优仅在两端标称带宽留空时由协调模块探测。
 measure_bandwidth(){
   local peer="$1" dur="${2:-10}" res="" gp a
   for a in 1 2 3; do res=$(run_iperf "$peer" "$dur" 4); [ -n "$res" ] && break; sleep 8; done
@@ -2281,7 +2281,7 @@ loss_pct(){   # loss_pct <重传数> <吞吐Mbps> <秒数>
   }'
 }
 
-# 国际线路调优和公共节点验证使用以下判据；优化线路调优使用独立的双模式重传阈值。
+# 国际线路调优和公共节点验证使用以下判据；优化线路调优使用独立的单连接重传阈值。
 RETRANS_THRESHOLD=0.1
 VERIFY_GOOD_PCT=90
 VERIFY_ACCEPT_PCT=75
@@ -3051,15 +3051,15 @@ detect_return_server(){
 }
 
 cmd_return(){
-  local server="" server_bw="" client_bw="" control_port=5211 iperf_port=5212 role=proxy yes=0 ttl=600
-  local ports_given=0 family_given=0 args=() choice repeats=2 repeats_given=0
+  local server="" server_bw="" client_bw="" control_port=12223 iperf_port=12224 role=proxy yes=0 ttl=600
+  local family_given=0 args=() choice repeats=2 repeats_given=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --server|--server-bw|--client-bw|--control-port|--iperf-port|--role|--token-ttl|--repeats)
         [ $# -ge 2 ] || die "$1 缺少参数"
         case "$1" in
           --server) server="$2" ;; --server-bw) server_bw="$2" ;; --client-bw) client_bw="$2" ;;
-          --control-port) control_port="$2"; ports_given=1 ;; --iperf-port) iperf_port="$2"; ports_given=1 ;;
+          --control-port) control_port="$2" ;; --iperf-port) iperf_port="$2" ;;
           --role) role="$2" ;; --token-ttl) ttl="$2" ;;
           --repeats) repeats="$2"; repeats_given=1 ;;
         esac
@@ -3068,11 +3068,13 @@ cmd_return(){
       -y|--yes) yes=1; shift ;;
       -h|--help)
         printf '%s\n' '优化线路调优' '用法: tcpfit return [--server 可达地址] [--server-bw Mbps] [--client-bw Mbps]' \
-          '       [--control-port 5211] [--iperf-port 5212] [--role proxy|bulk|mixed] [-4|-6] [--yes]' \
+          '       [--control-port 端口] [--iperf-port 端口] [--role proxy|bulk|mixed] [-4|-6] [--yes]' \
           '       [--token-ttl 600]（30-1800 秒，配对成功即失效）' \
-          '       [--repeats 2]（每种连接数每次评估共测 2-10 次）' \
+          '       [--repeats 2]（每次评估共测 2-10 次，缓冲区只测单连接）' \
           '服务器地址自动探测，失败后才需手动填写；也可用 --server 指定。' \
-          '带宽可留空。自动测速后回车保存推荐配置，或输入测速序号选配置；--yes 自动保存推荐。'
+          '接入端口默认为 TCP 12223，测速端口默认为 TCP 12224，无需填写。' \
+          '填写标称带宽时取已填值中的较小值；两端都留空时自动用四连接探测带宽。' \
+          '自动测速后回车保存推荐配置，或输入测速序号选配置；--yes 自动保存推荐。'
         return 0 ;;
       *) die "未知优化线路调优参数: $1" ;;
     esac
@@ -3101,21 +3103,17 @@ cmd_return(){
   fi
   [ -n "$server" ] || die "无法获取服务器可达地址，请使用 --server 指定，或重新进入菜单填写"
   if [ "$yes" = 0 ]; then
-    [ -n "$server_bw" ] || server_bw=$(ask "  服务器标称出口 Mbps（已知建议填，回车留空）" "")
-    [ -n "$client_bw" ] || client_bw=$(ask "  家宽标称下载 Mbps（已知建议填，回车留空）" "")
+    [ -n "$server_bw" ] || server_bw=$(ask "  服务器标称出口 Mbps（回车留空）" "")
+    [ -n "$client_bw" ] || client_bw=$(ask "  家宽标称下载 Mbps（回车留空）" "")
     if [ "$repeats_given" = 0 ]; then
-      repeats=$(ask "  每种连接数每次评估的测速次数（2-10）" 2)
-    fi
-    if [ "$ports_given" = 0 ]; then
-      control_port=$(ask "  接入端口 TCP" 5211)
-      iperf_port=$(ask "  测速端口 TCP" 5212)
+      repeats=$(ask "  每次评估的测速次数（2-10）" 2)
     fi
     choice=$(ask "  用途 1) 代理/加速  2) 大文件  3) 混合" 1)
     case "$choice" in 1) role=proxy ;; 2) role=bulk ;; 3) role=mixed ;; *) die "用途必须为 1、2 或 3" ;; esac
   fi
-  is_posint "$control_port" 1024 65535 || die "接入端口必须是 1024-65535 的整数"
-  is_posint "$iperf_port" 1024 65535 || die "测速端口必须是 1024-65535 的整数"
-  [ "$control_port" != "$iperf_port" ] || die "接入端口和测速端口不能相同"
+  [ "$control_port" = 0 ] || is_posint "$control_port" 1024 65535 || die "接入端口必须是 1024-65535 的整数，或用 0 自动选择"
+  [ "$iperf_port" = 0 ] || is_posint "$iperf_port" 1024 65535 || die "测速端口必须是 1024-65535 的整数，或用 0 自动选择"
+  [ "$control_port" = 0 ] || [ "$control_port" != "$iperf_port" ] || die "接入端口和测速端口不能相同"
   is_posint "$ttl" 30 1800 || die "token 有效期必须是 30-1800 秒"
   is_posint "$repeats" 2 10 || die "测速次数必须是 2-10 的整数"
   [ -z "$server_bw" ] || is_posint "$server_bw" 1 1000000 || die "服务器标称带宽必须是 1-1000000 Mbps 的整数"
@@ -3123,17 +3121,24 @@ cmd_return(){
   case "$role" in proxy|bulk|mixed) ;; *) die "用途必须是 proxy / bulk / mixed" ;; esac
   echo
   _conf "服务器地址" "$server（IPv${IP_FAMILY#-}）"
-  _conf "接入 / 测速端口" "$control_port / $iperf_port TCP"
+  local control_display="$control_port" iperf_display="$iperf_port"
+  [ "$control_port" != 0 ] || control_display="自动选择"
+  [ "$iperf_port" != 0 ] || iperf_display="自动选择"
+  _conf "接入 / 测速端口" "$control_display / $iperf_display TCP"
   _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
-  _conf "测试方式" "单连接和四连接每次评估各测 $repeats 次，任务限时 30 分钟"
-  _conf "缓冲区试调" "分两阶段，每轮只测当前连接数；合计最多 8 轮，连续 3 轮无收益停止"
-  _conf "带宽含义" "实测是当前路径可用带宽，标称值仅作能力参考"
+  _conf "测试方式" "缓冲区只测单连接，已有整形验证保留四连接；每次评估测 $repeats 次，任务限时 30 分钟"
+  _conf "缓冲区试调" "最多 8 轮，连续 3 轮无收益停止，结束后独立复测单连接"
+  if [ -n "$server_bw" ] || [ -n "$client_bw" ]; then
+    _conf "带宽参考" "取已填标称带宽的较小值，不额外探测"
+  else
+    _conf "带宽参考" "两端均留空，自动用四连接探测当前路径带宽"
+  fi
   local firewall_binary=iptables
   [ "$IP_FAMILY" != -6 ] || firewall_binary=ip6tables
   if command -v ufw >/dev/null || command -v nft >/dev/null || command -v "$firewall_binary" >/dev/null; then
-    _conf "端口规则" "复用已有防火墙工具，不安装"
+    _conf "端口规则" "复用已有防火墙临时放行，退出时撤销"
   else
-    _conf "端口规则" "没有可用工具，测速端口不限制来源 IP"
+    _conf "端口规则" "未检测到可用防火墙工具，跳过规则管理，继续测试"
   fi
   if [ "$yes" = 0 ]; then confirm "  开始并等待家宽接入？" y || { info "已取消"; return 0; }; fi
   return_dependencies || die "依赖准备失败，未开始测速"

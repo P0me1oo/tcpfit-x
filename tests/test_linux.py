@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -110,6 +111,74 @@ class LinuxIntegrationTests(unittest.TestCase):
             restore = subprocess.run([sys.executable, str(ROOT / "tcpfit-return.py"), "restore", "--snapshot", "/nonexistent"], capture_output=True, text=True)
             self.assertNotEqual(restore.returncode, 0)
             self.assertIn("已有 tcpfit 任务", restore.stderr)
+
+    def test_sigint_releases_ports_while_waiting_and_during_measurement(self):
+        if not shutil.which("iperf3"):
+            self.skipTest("本用例需要已有的 iperf3")
+        for measuring in (False, True):
+            with self.subTest(measuring=measuring), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                fixture = directory / "interrupt.py"
+                fixture.write_text('''import importlib.util, pathlib, secrets, signal, sys, time, types
+spec = importlib.util.spec_from_file_location("ret", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = pathlib.Path(sys.argv[2]); (d / "measurements").mkdir()
+args = types.SimpleNamespace(family=4, control_port=0, iperf_port=0, token_ttl=60)
+with m.reserve_ports(args) as reservations:
+    firewall = m.Firewall(d, 4, args.control_port, args.iperf_port, secrets.token_hex(8))
+    coordinator = m.Coordinator(args, d, d, firewall)
+    coordinator.port_reservations = reservations
+    signal.signal(signal.SIGINT, lambda signum, frame: coordinator.fail("调优任务收到取消或断线信号"))
+    try:
+        firewall.setup()
+        m.start_http(coordinator)
+        if sys.argv[3] == "1":
+            firewall.pair("127.0.0.1")
+            m.atomic_json(d / "request.json", {"id": secrets.token_hex(8), "streams": 1, "duration": 10, "stage": "中断验证"})
+            coordinator.next_job()
+        m.atomic_json(d / "ready.json", {"control": args.control_port, "iperf": args.iperf_port})
+        while True:
+            coordinator.check()
+            time.sleep(0.05)
+    except m.TaskError:
+        pass
+    finally:
+        coordinator.close()
+        m.Firewall.cleanup(firewall.path)
+''', encoding="utf-8")
+                owner = subprocess.Popen([sys.executable, str(fixture), str(ROOT / "tcpfit-return.py"), str(directory), "1" if measuring else "0"],
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not (directory / "ready.json").exists() and time.monotonic() < deadline:
+                        self.assertIsNone(owner.poll())
+                        time.sleep(0.05)
+                    self.assertTrue((directory / "ready.json").exists())
+                    ports = MODULE.read_json(directory / "ready.json")
+                    for port in ports.values():
+                        with socket.socket() as probe:
+                            with self.assertRaises(OSError):
+                                probe.bind(("0.0.0.0", port))
+                    process = MODULE.read_json(directory / "iperf.json") if measuring else None
+                    owner.send_signal(signal.SIGINT)
+                    output = owner.communicate(timeout=15)[0]
+                    self.assertEqual(owner.returncode, 0, output)
+                    self.assertIn("取消或断线信号", output)
+                    for port in ports.values():
+                        with socket.socket() as probe:
+                            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                            probe.bind(("0.0.0.0", port))
+                            probe.listen(1)
+                    self.assertFalse((directory / "firewall.json").exists())
+                    if process:
+                        self.assertNotEqual(MODULE.process_stamp(process["pid"]), process["stamp"])
+                finally:
+                    if owner.poll() is None:
+                        owner.kill()
+                    owner.communicate(timeout=10)
+                    if (directory / "iperf.json").exists():
+                        MODULE.stop_process(MODULE.read_json(directory / "iperf.json"))
+                    MODULE.Firewall.cleanup(directory / "firewall.json")
 
     def test_client_sigkill_revokes_credentials_and_reports_failure(self):
         with tempfile.TemporaryDirectory() as directory:

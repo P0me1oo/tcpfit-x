@@ -49,11 +49,12 @@ def run_shell(code, *args, env=None):
 
 class ReturnEntryTests(unittest.TestCase):
     def run_return(self, *args, route="1.1.1.1 dev eth0 src 8.8.8.8 uid 0", ipify="", fallback="",
-                   manual="", ipify_status=0, fallback_status=0, extra=""):
+                   manual="", ipify_status=0, fallback_status=0, extra="", bandwidth=1000):
         env = dict(os.environ, TCPFIT_TEST_ROUTE=route, TCPFIT_TEST_IPIFY=ipify, TCPFIT_TEST_FALLBACK=fallback,
                    TCPFIT_TEST_MANUAL=manual, TCPFIT_TEST_IPIFY_STATUS=str(ipify_status),
                    TCPFIT_TEST_FALLBACK_STATUS=str(fallback_status))
-        return run_shell(RETURN_STUBS + extra + '\ncmd_return "$@"', *args, env=env)
+        defaults = ("--client-bw", str(bandwidth)) if bandwidth is not None else ()
+        return run_shell(RETURN_STUBS + extra + '\ncmd_return "$@"', *defaults, *args, env=env)
 
     def assert_started(self, result, address, family=4):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -110,11 +111,70 @@ class ReturnEntryTests(unittest.TestCase):
                 self.assertNotIn("CURL <", result.stderr)
                 self.assertNotIn("家宽可访问的服务器地址", result.stderr)
 
+    def test_ports_default_to_fixed_values_in_interactive_and_yes_modes(self):
+        for args in ((), ("--yes",)):
+            with self.subTest(args=args):
+                result = self.run_return(*args)
+                self.assert_started(result, "8.8.8.8")
+                self.assertIn("<--control-port> <12223>", result.stdout)
+                self.assertIn("<--iperf-port> <12224>", result.stdout)
+                self.assertIn("12223 / 12224 TCP", result.stdout)
+                self.assertNotIn("自动选择", result.stdout)
+                self.assertNotIn("端口 TCP", result.stderr)
+
+    def test_existing_port_options_remain_compatible_without_questions(self):
+        fixed = self.run_return("--control-port", "45211", "--iperf-port", "45212")
+        self.assert_started(fixed, "8.8.8.8")
+        self.assertIn("<--control-port> <45211>", fixed.stdout)
+        self.assertIn("<--iperf-port> <45212>", fixed.stdout)
+        self.assertNotIn("端口 TCP", fixed.stderr)
+        for option, value, other, default in (("--control-port", "45211", "--iperf-port", "12224"),
+                                              ("--iperf-port", "45212", "--control-port", "12223")):
+            with self.subTest(option=option):
+                mixed = self.run_return(option, value)
+                self.assert_started(mixed, "8.8.8.8")
+                self.assertIn("<{}> <{}>".format(option, value), mixed.stdout)
+                self.assertIn("<{}> <{}>".format(other, default), mixed.stdout)
+                self.assertNotIn("端口 TCP", mixed.stderr)
+
+    def test_invalid_or_duplicate_ports_stop_before_dependencies(self):
+        for option in ("--control-port", "--iperf-port"):
+            for value in ("-1", "1023", "65536", "1.5", "bad", ""):
+                with self.subTest(option=option, value=value):
+                    failed = self.run_return("--yes", option, value)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn("端口必须", failed.stderr)
+                    self.assertNotIn("DEPENDENCIES", failed.stdout)
+        duplicate = self.run_return("--yes", "--control-port", "45211", "--iperf-port", "45211")
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn("不能相同", duplicate.stderr)
+        self.assertNotIn("DEPENDENCIES", duplicate.stdout)
+
+    def test_missing_nominal_bandwidth_enables_four_connection_probe(self):
+        for args in ((), ("--yes",)):
+            with self.subTest(args=args):
+                result = self.run_return(*args, bandwidth=None)
+                self.assert_started(result, "8.8.8.8")
+                self.assertIn("两端均留空，自动用四连接探测", result.stdout)
+                self.assertNotIn("<--server-bw>", result.stdout)
+                self.assertNotIn("<--client-bw>", result.stdout)
+
+    def test_either_nominal_bandwidth_is_sufficient(self):
+        for option in ("--server-bw", "--client-bw"):
+            with self.subTest(option=option):
+                result = self.run_return("--yes", option, "1000", bandwidth=None)
+                self.assert_started(result, "8.8.8.8")
+                self.assertIn("<{}> <1000>".format(option), result.stdout)
+                self.assertIn("不额外探测", result.stdout)
+
     def test_repeat_count_defaults_cli_and_interactive_validation(self):
         default = self.run_return("--yes")
         self.assert_started(default, "8.8.8.8")
         self.assertIn("<--repeats> <2>", default.stdout)
         self.assertIn("<--yes>", default.stdout)
+        self.assertIn("缓冲区只测单连接", default.stdout)
+        self.assertIn("已有整形验证保留四连接", default.stdout)
+        self.assertNotIn("分两阶段", default.stdout)
         custom = self.run_return("--yes", "--repeats", "5")
         self.assert_started(custom, "8.8.8.8")
         self.assertIn("<--repeats> <5>", custom.stdout)

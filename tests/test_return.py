@@ -156,7 +156,7 @@ class DecisionTests(unittest.TestCase):
         rows = self.rows([600] * 3, [940, 960, 970])
         self.assertEqual(MODULE.shape_candidate(self.worker, 500, rows)[0], 915)
 
-    def test_base_change_requires_both_stream_counts_not_to_regress(self):
+    def test_base_change_requires_single_connection_not_to_regress(self):
         before = self.rows([400, 410, 420], [700, 710, 720])
         after = self.rows([410, 420, 430], [710, 720, 730])
         self.assertTrue(MODULE.base_decision(self.worker, before, after)[0])
@@ -174,11 +174,27 @@ class DecisionTests(unittest.TestCase):
         self.assertTrue(MODULE.base_decision(self.worker, before, after)[0])
         self.assertFalse(MODULE.retrans_acceptable(self.worker, before, after))
 
-    def test_speed_tolerance_is_bounded_for_each_stream_count(self):
+    def test_speed_tolerance_only_uses_single_connection(self):
         before = self.rows([100] * 3, [200] * 3)
         self.assertTrue(MODULE.base_decision(self.worker, before, self.rows([95] * 3, [190] * 3))[0])
         self.assertFalse(MODULE.base_decision(self.worker, before, self.rows([94.9] * 3, [220] * 3))[0])
-        self.assertFalse(MODULE.base_decision(self.worker, before, self.rows([110] * 3, [189.9] * 3))[0])
+        self.assertTrue(MODULE.base_decision(self.worker, before, self.rows([110] * 3, [100] * 3))[0])
+
+    def test_base_acceptance_needs_no_four_connection_data(self):
+        before = self.rows([100] * 3, [])
+        after = self.rows([98] * 3, [])
+        self.assertTrue(MODULE.base_decision(self.worker, before, after)[0])
+        self.assertFalse(MODULE.base_decision(self.worker, before, self.rows([], [200] * 3))[0])
+
+    def test_nominal_bandwidth_uses_smaller_known_value(self):
+        for server, client, expected in ((1000, 200, 200), (100, 1000, 100),
+                                         (1000, None, 1000), (None, 200, 200)):
+            with self.subTest(server=server, client=client):
+                self.assertEqual(MODULE.reference_bandwidth(server, client), expected)
+        self.assertIsNone(MODULE.reference_bandwidth(None, None))
+        for server, client in ((0, 1000), (-1, None), (None, 1000001), (True, 1000), (1.5, None)):
+            with self.subTest(server=server, client=client), self.assertRaises(MODULE.TaskError):
+                MODULE.reference_bandwidth(server, client)
 
     def test_obvious_outlier_is_unstable_and_cannot_be_accepted_as_improvement(self):
         before = self.rows([100] * 3, [200] * 3)

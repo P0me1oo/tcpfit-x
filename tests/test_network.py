@@ -50,26 +50,34 @@ class NetworkIntegrationTests(unittest.TestCase):
         af = socket.AF_INET if family == 4 else socket.AF_INET6
         target, peer, stranger = ("127.0.0.1", "127.0.0.2", "127.0.0.3") if family == 4 else ("::1", "::2", "::3")
         existing = "tcpfit_test_" + secrets.token_hex(4)
+        existing_iptables = None
         if family == 6:
             for address in (peer, stranger):
                 MODULE.command(["ip", "-6", "addr", "add", address + "/128", "dev", "lo", "nodad"])
         try:
-            with tempfile.TemporaryDirectory() as directory, socket.socket(af) as listener, socket.socket(af) as unrelated:
+            with tempfile.TemporaryDirectory() as directory, socket.socket(af) as listener, socket.socket(af) as control, socket.socket(af) as unrelated:
                 listener.bind(("0.0.0.0" if family == 4 else "::", 0))
                 listener.listen(20)
+                control.bind(("0.0.0.0" if family == 4 else "::", 0))
+                control.listen(20)
                 unrelated.bind((target, 0))
                 unrelated.listen(20)
                 port, other_port = listener.getsockname()[1], unrelated.getsockname()[1]
-                if existing_drop:
+                control_port = control.getsockname()[1]
+                if existing_drop and backend == "nft":
                     MODULE.command(["nft", "-f", "-"], input_data=(
                         "add table inet {table}\n"
                         "add chain inet {table} input {{ type filter hook input priority 0; policy drop; }}\n"
                         "add rule inet {table} input ct state established,related accept\n"
                         "add rule inet {table} input tcp dport {port} accept\n"
                     ).format(table=existing, port=other_port))
+                elif existing_drop:
+                    existing_iptables = ["INPUT", "-p", "tcp", "-m", "multiport", "--dports", "{},{}".format(control_port, port),
+                                         "-m", "comment", "--comment", existing, "-j", "DROP"]
+                    MODULE.command([binary, "-I"] + existing_iptables)
                 original_nft = self.normalized_nft() if backend == "nft" else None
                 original_iptables = self.iptables_rules(family) if backend == "iptables" else None
-                firewall = MODULE.Firewall(directory, family, port + 1, port, secrets.token_hex(8))
+                firewall = MODULE.Firewall(directory, family, control_port, port, secrets.token_hex(8))
                 def connect(source, destination_port=port):
                     with socket.socket(af) as client:
                         client.settimeout(0.3)
@@ -77,12 +85,16 @@ class NetworkIntegrationTests(unittest.TestCase):
                         return client.connect_ex((target, destination_port)) == 0
                 choice = {"backend": backend, "binary": binary, "manager": "ufw" if reload_ufw else None}
                 try:
+                    if existing_drop:
+                        self.assertFalse(connect(peer, control_port))
+                        self.assertFalse(connect(peer))
                     if reload_ufw:
                         firewall.setup()
                         self.assertEqual(firewall.state["manager"], "ufw")
                     else:
                         with mock.patch.object(MODULE.Firewall, "select", return_value=choice):
                             firewall.setup()
+                    self.assertTrue(connect(peer, control_port))
                     self.assertFalse(connect(peer))
                     firewall.pair(peer)
                     self.assertTrue(connect(peer))
@@ -90,6 +102,7 @@ class NetworkIntegrationTests(unittest.TestCase):
                     self.assertTrue(connect(stranger, other_port))
                     if reload_ufw:
                         MODULE.command(["ufw", "reload"])
+                        self.assertTrue(connect(peer, control_port))
                         self.assertTrue(connect(peer))
                         self.assertFalse(connect(stranger))
                     if legacy_record:
@@ -100,13 +113,18 @@ class NetworkIntegrationTests(unittest.TestCase):
                 finally:
                     MODULE.Firewall.cleanup(firewall.path)
                 self.assertFalse(firewall.path.exists())
+                if existing_drop:
+                    self.assertFalse(connect(peer, control_port))
+                    self.assertFalse(connect(peer))
                 if backend == "nft":
                     self.assertEqual(self.normalized_nft(), original_nft)
                 else:
                     self.assertEqual(self.iptables_rules(family), original_iptables)
         finally:
-            if existing_drop:
+            if existing_drop and backend == "nft":
                 MODULE.command(["nft", "delete", "table", "inet", existing], check=False)
+            if existing_iptables:
+                MODULE.command([binary, "-D"] + existing_iptables, check=False)
             if family == 6:
                 for address in (peer, stranger):
                     MODULE.command(["ip", "-6", "addr", "del", address + "/128", "dev", "lo"], check=False)
@@ -121,7 +139,7 @@ class NetworkIntegrationTests(unittest.TestCase):
         with mock.patch.object(MODULE.shutil, "which", side_effect=lambda name: None if name == "nft" else existing_which(name)):
             for family in (4, 6):
                 with self.subTest(family=family):
-                    self.exercise_filter("iptables", family)
+                    self.exercise_filter("iptables", family, existing_drop=True)
 
     def test_old_firewall_record_still_cleans_only_its_rules(self):
         self.exercise_filter("iptables", legacy_record=True)

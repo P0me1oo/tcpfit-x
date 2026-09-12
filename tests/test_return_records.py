@@ -52,11 +52,11 @@ class RecordTests(unittest.TestCase):
             baseline = self.book.measure_group("基线")
             trial = self.book.measure_group("试调", modes=(4,))
             custom = self.book.measure_group("自定义", modes=(1,), repeats=5)
-        self.assertEqual([row["streams"] for row in baseline], [1, 1, 4, 4])
+        self.assertEqual([row["streams"] for row in baseline], [1, 1])
         self.assertEqual([row["streams"] for row in trial], [4, 4])
         self.assertEqual(len(custom), 5)
-        self.assertEqual(self.worker.run.call_count, 11)
-        self.assertEqual([row["number"] for row in self.book.records], list(range(1, 12)))
+        self.assertEqual(self.worker.run.call_count, 9)
+        self.assertEqual([row["number"] for row in self.book.records], list(range(1, 10)))
         self.assertEqual(len(self.book.configurations), 1)
         self.assertEqual(json.loads((self.directory / "measurement-index.json").read_text(encoding="utf-8")), self.book.records)
 
@@ -84,7 +84,7 @@ class RecordTests(unittest.TestCase):
 
         self.worker.run.side_effect = fail_second
         with self.assertRaises(MODULE.TaskError):
-            self.book.measure_group("最终验证")
+            self.book.measure_group("最终验证", repeats=4)
         self.assertEqual([row["status"] for row in self.book.records], ["valid", "failed", "skipped", "skipped"])
         self.assertIn("未完成验证", self.book.records[0]["decision"])
         self.assertNotIn("estimated_retrans_pct", self.book.records[1])
@@ -105,10 +105,10 @@ class RecordTests(unittest.TestCase):
             self.book.measure_group("回退候选", modes=(4,))
         self.book.records[-1].update(decision="已回退", stability="unstable")
         self.book.records[0]["status"] = "failed"
-        answers = iter(["bad", "-1", "1.5", "999", "1", "9" * 5000, "0006"])
+        answers = iter(["bad", "-1", "1.5", "999", "1", "9" * 5000, "0004"])
         with redirect_stdout(io.StringIO()):
             selected, number = MODULE.select_configuration(self.book, "C1", reader=lambda: next(answers))
-        self.assertEqual((selected, number), ("C2", 6))
+        self.assertEqual((selected, number), ("C2", 4))
         self.assertEqual(MODULE.select_configuration(self.book, "C1", reader=lambda: ""), ("C1", None))
         self.assertEqual(self.book.configurations[selected]["sysctl"]["net.ipv4.tcp_congestion_control"], "cubic")
         output = io.StringIO()
