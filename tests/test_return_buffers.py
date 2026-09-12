@@ -218,7 +218,7 @@ class BufferTrialTests(unittest.TestCase):
         self.assertEqual(trials[2]["refine_from_max_bytes"], 20 * MIB)
         self.assertEqual(worker.changes, [(18 * MIB, MIB), (20 * MIB, MIB), (18 * MIB, MIB), (19 * MIB, MIB)])
         self.assertEqual(state, buffer_state(19))
-        self.assertIn("下调候选上限 20 MiB → 19 MiB，步长 1 MiB", output)
+        self.assertIn("候选收发缓冲区上限：20 MiB → 19 MiB（各减少 1 MiB）", output)
         self.assertIn("高重传边界的 1 MiB 微调已完成", output)
 
     def test_failed_fine_candidate_preserves_last_good_configuration_without_crossing_high_boundary(self):
@@ -273,7 +273,7 @@ class BufferTrialTests(unittest.TestCase):
         self.assertEqual(worker.changes, [(14 * MIB, MIB), (16 * MIB, MIB), (15 * MIB, MIB)])
         self.assertEqual([trial["kept"] for trial in trials], [False, True])
         self.assertEqual(state, buffer_state(15))
-        self.assertIn("回退后缩小步长", output)
+        self.assertIn("回退后减小每次调整量", output)
 
     def test_no_gain_search_continues_beyond_immediate_neighbors(self):
         initial = rows(retrans=6)
@@ -845,7 +845,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
                          [value * MIB for value in (18, 20, 19)])
         self.assertEqual(result["buffer_trials"][-1]["refine_from_max_bytes"], 20 * MIB)
         self.assertEqual([row["receiver_mbps"] for row in result["final"]], [110, 110])
-        self.assertIn("下调候选上限 20 MiB → 19 MiB", output)
+        self.assertIn("候选收发缓冲区上限：20 MiB → 19 MiB（各减少 1 MiB）", output)
 
     def test_trial_speed_guard_uses_the_initial_configuration_results(self):
         result, output = self.exercise_flow(False)

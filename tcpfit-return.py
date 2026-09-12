@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.16.0"
+VERSION = "0.16.2"
 MIB = 1048576
 BUFFER_MAX_BYTES = 2147483647
 BUFFER_MIN_STEP = MIB
@@ -1500,7 +1500,7 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
     measured = [row for row in measured if row["streams"] == streams]
     phase = {"phase": 1, "streams": streams, "status": "checking", "entry_measurements": measured}
     no_gain = 0
-    log("开始试调：重传不超过 1% 时上调 2 MiB，最高 2.5 × BDP，遇高重传后下调 1 MiB 微调")
+    log("开始试调：重传不超过 1% 时，收发缓冲区上限每次各增加 2 MiB，最高 2.5 × BDP；遇高重传后每次各减少 1 MiB 微调")
     atomic_json(trial_path, trials)
     visited = {maximum}
     direction = -1
@@ -1524,10 +1524,10 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
             refining = refine_from is not None
             if refining:
                 reference_max = refine_from
-                reason = "已触及高重传边界，按 1 MiB 下调微调"
+                reason = "已触及高重传边界，向下微调缓冲区"
                 next_target = next_buffer_refine_target(refine_from, previous_max, visited)
             else:
-                reason = "单连接重传不高，按 2 MiB 上调试探更大缓冲区"
+                reason = "单连接重传不高，尝试更大的缓冲区"
                 next_target = next_buffer_growth_target(previous_max, limit, visited)
         else:
             next_target = next_buffer_target(previous_max, limit, direction, step, visited, minimum)
@@ -1546,9 +1546,10 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
         visited.add(target)
         index = len(trials) + 1
         action = "上调" if direction > 0 else "下调"
-        log("第 {} 轮，单连接：{}；{}{} {} → {}，步长 {}".format(
-            index, reason, action, "候选上限" if refining else "收发上限",
-            format_mib(reference_max), format_mib(target), format_mib(step)))
+        log("第 {} 轮，单连接：{}；{}：{} → {}（各{} {}）".format(
+            index, reason, "候选收发缓冲区上限" if refining else "收发缓冲区上限",
+            format_mib(reference_max), format_mib(target),
+            "增加" if direction > 0 else "减少", format_mib(step)))
         log("保留配置：" + describe_measurements(measured))
         trial = {"round": index, "phase": 1, "streams": streams, "reason": reason,
                  "direction": action, "before": state, "before_measurements": measured,
@@ -1620,7 +1621,7 @@ def tune_buffers(worker, baseline, measured, state, limit, measure_group, trials
                 direction, step = 1, BUFFER_GROW_STEP
             elif step > BUFFER_MIN_STEP:
                 step = max(BUFFER_MIN_STEP, step // 2)
-                reason = "上一轮效果未通过，回退后缩小步长"
+                reason = "上一轮效果未通过，回退后减小每次调整量"
             else:
                 direction, step = -direction, BUFFER_MIN_STEP
                 reason = "上一轮无收益，回退后反向细调"
@@ -2039,8 +2040,8 @@ def validate_environment(args):
     validate_ports(args)
     if not 30 <= args.token_ttl <= 1800:
         raise TaskError("token 有效期必须在 30-1800 秒之间")
-    if isinstance(args.repeats, bool) or not isinstance(args.repeats, int) or not 2 <= args.repeats <= 10:
-        raise TaskError("测速次数必须是 2-10 的整数")
+    if isinstance(args.repeats, bool) or not isinstance(args.repeats, int) or not 1 <= args.repeats <= 10:
+        raise TaskError("测速次数必须是 1-10 的整数")
     reference_bandwidth(args.server_bw, args.client_bw)
     family = socket.AF_INET if args.family == 4 else socket.AF_INET6
     try:
@@ -2152,7 +2153,7 @@ def run_prepared_task(args, reservations):
         result["firewall"] = {"backend": firewall.state["backend"], "manager": firewall.state["manager"],
                               "source_ip_restricted": firewall.state["backend"] != "none"}
         start_http(coordinator)
-        log("接入 / 测速端口: {} / {} TCP；结束或 Ctrl+C 后释放端口并撤销临时规则".format(args.control_port, args.iperf_port))
+        log("接入 / 测速端口: {} / {} TCP".format(args.control_port, args.iperf_port))
         print("\n按测速端系统复制执行对应命令：\n\nLinux / OpenWrt / iStoreOS：\n{}\n\nWindows PowerShell：\n{}\n".format(
             join_command(args, coordinator.token), join_command(args, coordinator.token, "windows")), flush=True)
         log("token {} 秒内有效，只能配对一次。测速自动执行，结束后在调优端选择保存配置。".format(args.token_ttl))
@@ -2435,7 +2436,7 @@ def main():
     run.add_argument("--family", type=int, choices=(4, 6), default=4)
     run.add_argument("--role", choices=("proxy", "bulk", "mixed"), default="proxy")
     run.add_argument("--token-ttl", type=int, default=600)
-    run.add_argument("--repeats", type=int, choices=range(2, 11), default=MEASUREMENT_REPEATS)
+    run.add_argument("--repeats", type=int, choices=range(1, 11), default=MEASUREMENT_REPEATS)
     run.add_argument("--yes", action="store_true")
     run.add_argument("--server-bw", type=int)
     run.add_argument("--client-bw", type=int)

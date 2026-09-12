@@ -123,7 +123,7 @@ class HttpTransportTests(unittest.TestCase):
         for name in ("tcpfit.sh", "tcpfit-client.sh", "tcpfit-client.ps1"):
             shutil.copyfile(ROOT / name, root / name)
         args = types.SimpleNamespace(family=4, server="127.0.0.1", control_port=5211, iperf_port=5212,
-                                     token_ttl=60, repeats=2, server_bw=None, client_bw=1000,
+                                     token_ttl=60, repeats=1, server_bw=None, client_bw=1000,
                                      script=str(root / "tcpfit.sh"), client_script=str(root / "tcpfit-client.sh"))
         windows = root / "tcpfit-client.ps1"
         with mock.patch.object(MODULE.os, "geteuid", return_value=0, create=True), \

@@ -52,11 +52,19 @@ class RecordTests(unittest.TestCase):
             baseline = self.book.measure_group("基线")
             trial = self.book.measure_group("试调", modes=(4,))
             custom = self.book.measure_group("自定义", modes=(1,), repeats=5)
+            single = self.book.measure_group("单次评估", modes=(1, 4), repeats=1)
         self.assertEqual([row["streams"] for row in baseline], [1, 1])
         self.assertEqual([row["streams"] for row in trial], [4, 4])
         self.assertEqual(len(custom), 5)
-        self.assertEqual(self.worker.run.call_count, 9)
-        self.assertEqual([row["number"] for row in self.book.records], list(range(1, 10)))
+        self.assertEqual([row["streams"] for row in single], [1, 4])
+        for row in single:
+            self.assertEqual(row["repeats"], 1)
+            self.assertEqual(row["status"], "valid")
+            self.assertEqual(MODULE.measurement_issues(single, row["streams"]), [])
+            self.assertEqual(MODULE.median_metric(single, row["streams"], "receiver_mbps"), row["receiver_mbps"])
+        self.assertTrue(MODULE.base_decision(self.worker, single, single)[0])
+        self.assertEqual(self.worker.run.call_count, 11)
+        self.assertEqual([row["number"] for row in self.book.records], list(range(1, 12)))
         self.assertEqual(len(self.book.configurations), 1)
         self.assertEqual(json.loads((self.directory / "measurement-index.json").read_text(encoding="utf-8")), self.book.records)
 
@@ -260,11 +268,18 @@ class RawFailureTests(unittest.TestCase):
         self.assertNotIn("temporary", value["unparsed"])
         self.assertEqual(MODULE.raw_document('{"value": NaN}')["value"], "nan")
 
-    def test_python_cli_rejects_invalid_repeat_counts_before_environment_checks(self):
-        for value in ("1", "0", "11", "bad"):
-            result = subprocess.run([sys.executable, str(ROOT / "tcpfit-return.py"), "run",
-                                     "--script", "main", "--client-script", "client", "--server", "server",
-                                     "--repeats", value], capture_output=True, text=True, encoding="utf-8", timeout=10)
+    def test_python_cli_validates_repeat_counts_before_starting_task(self):
+        command = [str(ROOT / "tcpfit-return.py"), "run", "--script", "main",
+                   "--client-script", "client", "--server", "server"]
+        for options, expected in (([], 2), (["--repeats", "1"], 1), (["--repeats", "10"], 10)):
+            with self.subTest(expected=expected), mock.patch.object(sys, "argv", command + options), \
+                    mock.patch.object(MODULE, "run_task", return_value=0) as task:
+                self.assertEqual(MODULE.main(), 0)
+                task.assert_called_once()
+                self.assertEqual(task.call_args[0][0].repeats, expected)
+        for value in ("0", "11", "-1", "2.5", "bad", ""):
+            result = subprocess.run([sys.executable, *command, "--repeats", value],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=10)
             self.assertEqual(result.returncode, 2)
             self.assertIn("--repeats", result.stderr)
             self.assertNotIn("root", result.stderr)

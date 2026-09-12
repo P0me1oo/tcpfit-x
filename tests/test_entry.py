@@ -155,7 +155,7 @@ class ReturnEntryTests(unittest.TestCase):
             with self.subTest(args=args):
                 result = self.run_return(*args, bandwidth=None)
                 self.assert_started(result, "8.8.8.8")
-                self.assertIn("两端均留空，自动用四连接探测", result.stdout)
+                self.assertNotIn("带宽参考", result.stdout)
                 self.assertNotIn("<--server-bw>", result.stdout)
                 self.assertNotIn("<--client-bw>", result.stdout)
 
@@ -165,7 +165,7 @@ class ReturnEntryTests(unittest.TestCase):
                 result = self.run_return("--yes", option, "1000", bandwidth=None)
                 self.assert_started(result, "8.8.8.8")
                 self.assertIn("<{}> <1000>".format(option), result.stdout)
-                self.assertIn("不额外探测", result.stdout)
+                self.assertNotIn("带宽参考", result.stdout)
 
     def test_repeat_count_defaults_cli_and_interactive_validation(self):
         default = self.run_return("--yes")
@@ -181,13 +181,16 @@ class ReturnEntryTests(unittest.TestCase):
         self.assertNotIn("连续 3 轮无收益停止", default.stdout)
         self.assertNotIn("独立复测", default.stdout)
         self.assertNotIn("分两阶段", default.stdout)
-        custom = self.run_return("--yes", "--repeats", "5")
-        self.assert_started(custom, "8.8.8.8")
-        self.assertIn("<--repeats> <5>", custom.stdout)
-        interactive = self.run_return(extra='ask(){ case "$1" in *测速次数*) echo 4 ;; *) echo "${2:-}" ;; esac; }')
+        for value in ("1", "5", "10"):
+            with self.subTest(value=value):
+                custom = self.run_return("--yes", "--repeats", value)
+                self.assert_started(custom, "8.8.8.8")
+                self.assertIn("<--repeats> <{}>".format(value), custom.stdout)
+        interactive = self.run_return(extra='ask(){ case "$1" in *测速次数*) echo 1 ;; *) echo "${2:-}" ;; esac; }')
         self.assert_started(interactive, "8.8.8.8")
-        self.assertIn("<--repeats> <4>", interactive.stdout)
-        for value in ("0", "1", "11", "-1", "2.5", "bad", ""):
+        self.assertIn("<--repeats> <1>", interactive.stdout)
+        self.assertIn("单连接，每组 1 次", interactive.stdout)
+        for value in ("0", "11", "-1", "2.5", "bad", ""):
             with self.subTest(value=value):
                 failed = self.run_return("--yes", "--repeats", value)
                 self.assertNotEqual(failed.returncode, 0)
