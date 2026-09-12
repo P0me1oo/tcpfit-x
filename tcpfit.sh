@@ -36,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.11.0"
+VERSION="0.14.0"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -1644,7 +1644,6 @@ cmd_tune(){
   info "Derived from: ${bw} Mbps / RTT ${rtt} ms / ${ram} MB RAM / role $role"
   kv "  BDP"            "$(awk -v v="$bdp" 'BEGIN{printf "%.1f MB", v/1048576}')"
   kv "  Buffer max"     "$(awk -v v="$buf_max" 'BEGIN{printf "%.0f MB", v/1048576}')  ($(buf_max_reason "$bdp" "$ram" "$buf_max"))"
-  kv "  Buffer default" "$(awk -v v="$buf_def" 'BEGIN{printf "%.0f MB", v/1048576}')  (role $role)"
   kv "  tcp_mem"        "$(echo "$tcp_mem" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024, $2*4/1024, $3*4/1024}')  (RAM 1/16, 1/8, 1/4)"
 
   modprobe tcp_bbr 2>/dev/null
@@ -2903,14 +2902,14 @@ cmd_update(){
     rm -rf "$dl"; die "下载的文件校验不通过, 未更新" 2
   fi
   local f lib_dir="/usr/local/lib/tcpfit/$latest"
-  for f in tcpfit-return.py tcpfit-client.sh; do
+  for f in tcpfit-return.py tcpfit-client.sh tcpfit-client.ps1; do
     if ! curl -fsSL --max-time 60 "$base/$f" -o "$dl/$f" || \
        ! (cd "$dl" && grep -F "  $f" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
       rm -rf "$dl"; die "优化线路调优模块 $f 下载或校验失败，未更新" 2
     fi
   done
   mkdir -p "$lib_dir" || { rm -rf "$dl"; die "无法创建模块目录"; }
-  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh tcpfit-client.ps1; do
     install -m 755 "$dl/$f" "$lib_dir/$f.new" && mv -f "$lib_dir/$f.new" "$lib_dir/$f" || {
       rm -rf "$dl"; die "模块安装失败，主程序未更新";
     }
@@ -2941,22 +2940,22 @@ cmd_update(){
 return_assets(){
   local here dest dl f
   here=$(cd "$(dirname "$SOURCE_FILE")" 2>/dev/null && pwd)
-  if [ -f "$here/tcpfit.sh" ] && [ -f "$here/tcpfit-return.py" ] && [ -f "$here/tcpfit-client.sh" ]; then
+  if [ -f "$here/tcpfit.sh" ] && [ -f "$here/tcpfit-return.py" ] && [ -f "$here/tcpfit-client.sh" ] && [ -f "$here/tcpfit-client.ps1" ]; then
     RETURN_MAIN="$here/tcpfit.sh"; RETURN_HELPER="$here/tcpfit-return.py"; RETURN_CLIENT="$here/tcpfit-client.sh"
     return 0
   fi
   dest="/usr/local/lib/tcpfit/$VERSION"
-  if [ ! -f "$dest/tcpfit-return.py" ] || [ ! -f "$dest/tcpfit-client.sh" ] || [ ! -f "$dest/tcpfit.sh" ]; then
+  if [ ! -f "$dest/tcpfit-return.py" ] || [ ! -f "$dest/tcpfit-client.sh" ] || [ ! -f "$dest/tcpfit-client.ps1" ] || [ ! -f "$dest/tcpfit.sh" ]; then
     mkdir -p /usr/local/lib/tcpfit || return 1
     dl=$(mktemp -d /usr/local/lib/tcpfit/.download.XXXXXX) || return 1
     local base="https://raw.githubusercontent.com/$REPO/v$VERSION"
     curl -fsSL --max-time 30 "$base/SHA256SUMS" -o "$dl/SHA256SUMS" || { rm -rf "$dl"; return 1; }
-    for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+    for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh tcpfit-client.ps1; do
       curl -fsSL --max-time 60 "$base/$f" -o "$dl/$f" || { rm -rf "$dl"; return 1; }
       (cd "$dl" && grep -F "  $f" SHA256SUMS | sha256sum -c - >/dev/null 2>&1) || { rm -rf "$dl"; return 1; }
     done
     mkdir -p "$dest" || { rm -rf "$dl"; return 1; }
-    for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+    for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh tcpfit-client.ps1; do
       install -m 755 "$dl/$f" "$dest/$f" || { rm -rf "$dl"; return 1; }
     done
     rm -rf "$dl"
@@ -3074,7 +3073,7 @@ cmd_return(){
           '服务器地址自动探测，失败后才需手动填写；也可用 --server 指定。' \
           '接入端口默认为 TCP 12223，测速端口默认为 TCP 12224，无需填写。' \
           '填写标称带宽时取已填值中的较小值；两端都留空时自动用四连接探测带宽。' \
-          '自动测速后回车保存推荐配置，或输入测速序号选配置；--yes 自动保存推荐。'
+          '自动测速后按配置序号选择，回车保存推荐配置；--yes 自动保存推荐。'
         return 0 ;;
       *) die "未知优化线路调优参数: $1" ;;
     esac
@@ -3084,8 +3083,7 @@ cmd_return(){
   take_lock
   if [ "$yes" = 0 ]; then
     echo; step "优化线路调优"
-    echo "    家宽主动连接，服务器发送测试数据；接入后自动执行。"
-    echo "    将保存当前配置，验证基础调优；已有整形只可能保持或验证后提高。"
+    echo "    家宽接入后自动测速，结束后选择保存配置。"
     echo "    需要 python3、iperf3 和 curl，缺少时自动安装。"
     echo "    接入使用 HTTP；防火墙只复用已有工具，不安装。"
   fi
@@ -3126,8 +3124,8 @@ cmd_return(){
   [ "$iperf_port" != 0 ] || iperf_display="自动选择"
   _conf "接入 / 测速端口" "$control_display / $iperf_display TCP"
   _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
-  _conf "测试方式" "缓冲区只测单连接，已有整形验证保留四连接；每次评估测 $repeats 次，任务限时 30 分钟"
-  _conf "缓冲区试调" "最多 8 轮，连续 3 轮无收益停止，结束后独立复测单连接"
+  _conf "测试方式" "单连接，每组 $repeats 次"
+  _conf "缓冲区试调" "BDP + 2 MiB 起步，最多 8 轮，连续 3 轮无收益停止"
   if [ -n "$server_bw" ] || [ -n "$client_bw" ]; then
     _conf "带宽参考" "取已填标称带宽的较小值，不额外探测"
   else

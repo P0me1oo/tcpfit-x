@@ -40,8 +40,14 @@ def main():
             firewall.setup()
             MODULE.start_http(coordinator)
             print(MODULE.join_command(args, coordinator.token), flush=True)
+            print("Windows PowerShell：", flush=True)
+            print(MODULE.join_command(args, coordinator.token, "windows"), flush=True)
             while not coordinator.paired.wait(0.5):
                 coordinator.check()
+            idle = coordinator.measure_idle_latency(2)
+            assert all(sample["mean_ms"] is not None for sample in idle)
+            assert not coordinator.results
+            print("空载延迟采集通过", flush=True)
             for streams in (1, 4):
                 MODULE.request_measurement(types.SimpleNamespace(run_dir=str(run_dir), duration=4, streams=streams, stage="双端协议验证"))
                 measured = coordinator.results[-1]

@@ -43,7 +43,7 @@ if [ "$MODE" = agent ]; then
   dl=$(mktemp -d)
   trap 'rm -rf "$dl"' EXIT
   curl -fsSL --max-time 30 "$RAW/SHA256SUMS" -o "$dl/SHA256SUMS" || die "下载校验清单失败"
-  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh tcpfit-client.ps1; do
     curl -fsSL --max-time 60 "$RAW/$f" -o "$dl/$f" || die "下载 $f 失败"
     (cd "$dl" && grep -F "  $f" SHA256SUMS | sha256sum -c - >/dev/null 2>&1) || die "$f 校验失败，未安装"
   done
@@ -51,7 +51,7 @@ if [ "$MODE" = agent ]; then
   [ -n "$version" ] || die "无法读取版本号"
   lib_dir="/usr/local/lib/tcpfit/$version"
   mkdir -p "$PREFIX" "$lib_dir"
-  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh; do
+  for f in tcpfit.sh tcpfit-return.py tcpfit-client.sh tcpfit-client.ps1; do
     install -m 755 "$dl/$f" "$lib_dir/$f.new"
     mv -f "$lib_dir/$f.new" "$lib_dir/$f"
   done

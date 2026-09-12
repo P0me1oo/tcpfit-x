@@ -1,7 +1,7 @@
 #!/bin/sh
 # tcpfit 优化线路调优测速端：兼容常规 Linux、OpenWrt、iStoreOS 的 /bin/sh。
 # 本脚本只安装缺少的工具、主动连接和回报测量；不修改网络参数或启动入站服务。
-TCPFIT_CLIENT_VERSION="0.11.0"
+TCPFIT_CLIENT_VERSION="0.14.0"
 set -u
 umask 077
 
@@ -110,17 +110,22 @@ sample_once(){
   printf '%s\n' "$sample_value"
 }
 
-run_test(){
-  job="$1"; duration="$2"; streams="$3"
+sample_idle(){
+  job="$1"
   case "$job" in ''|*[!a-f0-9]*) abort "调优端发送了无效测试编号" ;; esac
   [ "${#job}" = 16 ] || abort "测试编号长度不符"
-  case "$duration" in ''|*[!0-9]*) abort "测试时长无效" ;; esac
-  [ "$duration" -ge 1 ] && [ "$duration" -le 600 ] || abort "测试时长超出范围"
-  case "$streams" in 1|4) ;; *) abort "只接受单连接或四连接下载测试" ;; esac
-  printf '[*] 空载延迟采集，随后进行 %s 秒 × %s 连接下载\n' "$duration" "$streams"
   : > "$work/idle"
   for sample in 1 2 3 4 5; do sample_once >> "$work/idle"; done
   api POST "/latency/$job/idle" --data-binary "@$work/idle" || abort "空载延迟回报失败"
+}
+
+run_test(){
+  job="$1"; duration="$2"; streams="$3"
+  case "$duration" in ''|*[!0-9]*) abort "测试时长无效" ;; esac
+  [ "$duration" -ge 1 ] && [ "$duration" -le 600 ] || abort "测试时长超出范围"
+  case "$streams" in 1|4) ;; *) abort "只接受单连接或四连接下载测试" ;; esac
+  printf '[*] 测速：%s 秒 × %s 连接\n' "$duration" "$streams"
+  sample_idle "$job"
   iperf3 "$family" -c "$server" -p "$iperf_port" -R -P "$streams" -t "$duration" -J > "$work/iperf.json" 2> "$work/iperf.err" &
   iperf_pid=$!
   printf '%s %s\n' "$iperf_pid" "$(proc_stamp "$iperf_pid")" > "$work/iperf.pid"
@@ -194,6 +199,11 @@ main(){
     api GET /next || abort "与调优端的会话中断"
     case "$reply" in
       WAIT) sleep 1 ;;
+      'LATENCY '*)
+        set -- $reply
+        [ $# = 2 ] || abort "延迟采集请求格式无效"
+        printf '[*] 采集空载延迟\n'
+        sample_idle "$2" ;;
       'RUN '*)
         set -- $reply
         [ $# = 4 ] || abort "测试请求格式无效"

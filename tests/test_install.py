@@ -36,7 +36,7 @@ if 'api.github.com' in url:
 else:
     name=url.rsplit('/',1)[-1]
     data=(root/name).read_bytes()
-    if name=='tcpfit-client.sh' and os.environ.get('TCPFIT_TEST_DAMAGE')=='1':
+    if name=='tcpfit-client.ps1' and os.environ.get('TCPFIT_TEST_DAMAGE')=='1':
         data+=b'\\n# test-only-corruption\\n'
 if '-o' in sys.argv:
     pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_bytes(data)
@@ -47,7 +47,7 @@ else:
             env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], TCPFIT_TEST_FIXTURE=str(fixture), TCPFIT_NO_TELEMETRY="1")
             def publish(version):
                 hashes = []
-                for name in ("tcpfit.sh", "install.sh", "tcpfit-return.py", "tcpfit-client.sh"):
+                for name in ("tcpfit.sh", "install.sh", "tcpfit-return.py", "tcpfit-client.sh", "tcpfit-client.ps1"):
                     content = (ROOT / name).read_text(encoding="utf-8").replace(SOURCE_VERSION, version).encode("utf-8")
                     (fixture / name).write_bytes(content)
                     hashes.append(hashlib.sha256(content).hexdigest() + "  " + name)
@@ -58,7 +58,7 @@ else:
             installed = run("bash", str(ROOT / "install.sh"))
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             entry = Path("/usr/local/bin/tcpfit")
-            for name in ("tcpfit.sh", "tcpfit-return.py", "tcpfit-client.sh"):
+            for name in ("tcpfit.sh", "tcpfit-return.py", "tcpfit-client.sh", "tcpfit-client.ps1"):
                 self.assertEqual((Path("/usr/local/lib/tcpfit/0.6.0") / name).read_bytes(), (fixture / name).read_bytes())
             resolved = run("bash", "-c", 'source "$1"; return_assets; test "$RETURN_HELPER" = /usr/local/lib/tcpfit/0.6.0/tcpfit-return.py', "test-assets", str(entry))
             self.assertEqual(resolved.returncode, 0, resolved.stdout + resolved.stderr)
@@ -72,7 +72,7 @@ else:
             passed = run("bash", "-c", update, "test-update", str(entry))
             self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
             self.assertEqual(entry.read_bytes(), (fixture / "tcpfit.sh").read_bytes())
-            for name in ("tcpfit.sh", "tcpfit-return.py", "tcpfit-client.sh"):
+            for name in ("tcpfit.sh", "tcpfit-return.py", "tcpfit-client.sh", "tcpfit-client.ps1"):
                 self.assertEqual((Path("/usr/local/lib/tcpfit/0.6.1") / name).read_bytes(), (fixture / name).read_bytes())
 
 

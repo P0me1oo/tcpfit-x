@@ -91,12 +91,13 @@ class RecordTests(unittest.TestCase):
         self.assertTrue(MODULE.measurement_issues(self.book.records, 1))
         output = io.StringIO()
         with redirect_stdout(output):
-            MODULE.measurement_table(self.book.records, "C1")
+            MODULE.measurement_table(self.book, "C1")
         lines = [line for line in output.getvalue().splitlines() if " | " in line]
-        self.assertEqual(len(lines), 5)
-        self.assertIn("失败", lines[2])
-        self.assertIn("跳过", lines[3])
-        self.assertIn("未取得 | 未取得", lines[2])
+        self.assertEqual(len(lines), 2)
+        self.assertIn("失败", lines[1])
+        self.assertIn("跳过", lines[1])
+        self.assertIn("未完成", lines[1])
+        self.assertIn("100.00 / 0.010", lines[1])
 
     def test_selection_accepts_rejected_and_unstable_valid_samples_and_rejects_invalid_numbers(self):
         with redirect_stdout(io.StringIO()):
@@ -104,25 +105,80 @@ class RecordTests(unittest.TestCase):
             self.current = snapshot(14, cc="cubic")
             self.book.measure_group("回退候选", modes=(4,))
         self.book.records[-1].update(decision="已回退", stability="unstable")
-        self.book.records[0]["status"] = "failed"
-        answers = iter(["bad", "-1", "1.5", "999", "1", "9" * 5000, "0004"])
+        answers = iter(["bad", "-1", "1.5", "999", "0", "9" * 5000, "0002"])
         with redirect_stdout(io.StringIO()):
             selected, number = MODULE.select_configuration(self.book, "C1", reader=lambda: next(answers))
-        self.assertEqual((selected, number), ("C2", 4))
+        self.assertEqual((selected, number), ("C2", 2))
         self.assertEqual(MODULE.select_configuration(self.book, "C1", reader=lambda: ""), ("C1", None))
         self.assertEqual(self.book.configurations[selected]["sysctl"]["net.ipv4.tcp_congestion_control"], "cubic")
         output = io.StringIO()
         with redirect_stdout(output):
-            MODULE.measurement_table(self.book.records, "C1")
-        self.assertIn("自动推荐配置", output.getvalue())
+            MODULE.measurement_table(self.book, "C1")
+        self.assertIn("推荐", output.getvalue())
         self.assertIn("已回退", output.getvalue())
         self.assertIn("不稳定", output.getvalue())
+        self.assertNotIn("C1", output.getvalue())
+        self.assertNotIn("C2", output.getvalue())
 
     def test_yes_never_reads_input(self):
         reader = mock.Mock(side_effect=AssertionError("不应询问"))
         with redirect_stdout(io.StringIO()):
+            self.book.measure_group("初值测速")
             self.assertEqual(MODULE.select_configuration(self.book, "C1", automatic=True, reader=reader), ("C1", None))
         reader.assert_not_called()
+
+    def test_same_parameters_merge_repeats_and_modes_with_separate_snapshots(self):
+        with redirect_stdout(io.StringIO()):
+            self.book.measure_group("候选", modes=(1, 4))
+            self.current["files"]["persisted.conf"] = {"data": "c2F2ZWQ="}
+            self.current["service_active"] = True
+            final = self.book.measure_group("队列验证", modes=(1, 4))
+        self.assertEqual(len(self.book.configurations), 2)
+        recommended = final[0]["config_id"]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            groups = MODULE.measurement_table(self.book, recommended)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]["measurements"]), 8)
+        self.assertEqual(len(groups[0]["config_ids"]), 2)
+        self.assertEqual(len([line for line in output.getvalue().splitlines() if " | " in line]), 2)
+        self.assertIn("100.00 / 0.010 | 200.00 / 0.010", output.getvalue())
+        self.assertEqual(MODULE.select_configuration(self.book, recommended, reader=lambda: "1"), (recommended, 1))
+
+    def test_equal_buffer_limits_do_not_merge_different_tcp_or_queue_parameters(self):
+        with redirect_stdout(io.StringIO()):
+            self.book.measure_group("初值")
+            self.current["sysctl"]["net.ipv4.tcp_congestion_control"] = "cubic"
+            self.book.measure_group("不同拥塞控制")
+            self.current["queue"]["rate"] = 500
+            self.book.measure_group("不同限速")
+        self.assertEqual(len(MODULE.configuration_groups(self.book)), 3)
+
+    def test_configuration_without_valid_measurements_cannot_be_selected(self):
+        with redirect_stdout(io.StringIO()):
+            initial = self.book.measure_group("初值")
+        self.current = snapshot(14)
+        self.worker.run.side_effect = MODULE.TaskError("测速失败")
+        with self.assertRaises(MODULE.TaskError):
+            self.book.measure_group("失败候选")
+        recommendation = initial[0]["config_id"]
+        answers = iter(["2", "1"])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            MODULE.measurement_table(self.book, recommendation)
+            selected = MODULE.select_configuration(self.book, recommendation, reader=lambda: next(answers))
+        self.assertEqual(selected, (recommendation, 1))
+        self.assertIn("未取得 / 未取得", output.getvalue())
+        self.assertIn("请输入表中可选的配置序号", output.getvalue())
+
+    def test_unmeasured_rollback_recommendation_gets_a_selectable_number(self):
+        original = self.book.register(snapshot(8, "cubic"))
+        with redirect_stdout(io.StringIO()):
+            self.book.measure_group("初值")
+            groups = MODULE.measurement_table(self.book, original)
+        self.assertEqual([group["number"] for group in groups], [1, 2])
+        self.assertEqual(MODULE.configuration_verdict(groups[1], original), "推荐 / 未测速")
+        self.assertEqual(MODULE.select_configuration(self.book, original, reader=lambda: "2"), (original, 2))
 
     def test_obvious_speed_and_retransmission_spread_and_missing_metrics_are_invalid(self):
         for field, value in (("receiver_mbps", 40), ("estimated_retrans_pct", 0.8),

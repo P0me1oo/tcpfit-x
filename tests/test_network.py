@@ -194,6 +194,9 @@ class NetworkIntegrationTests(unittest.TestCase):
                 while not coordinator.paired.wait(0.1) and time.monotonic() < deadline:
                     self.assertIsNone(client.poll())
                 self.assertTrue(coordinator.paired.is_set())
+                idle = coordinator.measure_idle_latency(2)
+                self.assertTrue(all(sample["mean_ms"] is not None for sample in idle))
+                self.assertEqual(coordinator.results, [])
                 for streams in (1, 4):
                     MODULE.request_measurement(types.SimpleNamespace(run_dir=str(runtime), duration=1, streams=streams, stage="HTTP 协议验证"))
                     measured = coordinator.results[-1]
