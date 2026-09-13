@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.16.2"
+VERSION = "0.17.0"
 MIB = 1048576
 BUFFER_MAX_BYTES = 2147483647
 BUFFER_MIN_STEP = MIB
@@ -2003,7 +2003,15 @@ def windows_client_script(args):
     return Path(args.client_script).with_name("tcpfit-client.ps1")
 
 
-def join_command(args, token, platform="linux"):
+def join_command(args, token, platform="auto"):
+    if platform == "auto":
+        # PowerShell 把 Shell 分支视为块注释；Shell 把 PowerShell 分支视为不展开的 here-doc。
+        # 下载和执行放在子 Shell 中，保留客户端退出码，且不会退出用户的终端。
+        # 空行让 PowerShell 逐行读取时结束前面的多行语句。
+        return ("echo `# <#` >/dev/null\n"
+                "( " + join_command(args, token, "linux") + "; ) <<'#TCPFIT_POWERSHELL'\n"
+                "#> | Out-Null\n\n" + join_command(args, token, "windows") + "\n"
+                "#TCPFIT_POWERSHELL")
     host = "[{}]".format(args.server) if args.family == 6 else args.server
     if platform == "windows":
         quote = lambda value: "'" + str(value).replace("'", "''") + "'"
@@ -2154,8 +2162,8 @@ def run_prepared_task(args, reservations):
                               "source_ip_restricted": firewall.state["backend"] != "none"}
         start_http(coordinator)
         log("接入 / 测速端口: {} / {} TCP".format(args.control_port, args.iperf_port))
-        print("\n按测速端系统复制执行对应命令：\n\nLinux / OpenWrt / iStoreOS：\n{}\n\nWindows PowerShell：\n{}\n".format(
-            join_command(args, coordinator.token), join_command(args, coordinator.token, "windows")), flush=True)
+        print("\n在测速端完整复制以下命令执行（Linux / OpenWrt / iStoreOS 或 Windows PowerShell）：\n\n{}\n".format(
+            join_command(args, coordinator.token)), flush=True)
         log("token {} 秒内有效，只能配对一次。测速自动执行，结束后在调优端选择保存配置。".format(args.token_ttl))
         while not coordinator.paired.wait(0.5):
             coordinator.check()

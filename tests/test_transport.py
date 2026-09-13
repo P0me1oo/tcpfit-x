@@ -3,6 +3,7 @@ import http.client
 import importlib.util
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -141,12 +142,35 @@ class HttpTransportTests(unittest.TestCase):
         for family, server, host in ((4, "192.0.2.1", "192.0.2.1"), (6, "2001:db8::1", "[2001:db8::1]")):
             with self.subTest(family=family):
                 args = types.SimpleNamespace(family=family, server=server, control_port=5211, iperf_port=5212)
-                join = MODULE.join_command(args, self.coordinator.token)
+                join = MODULE.join_command(args, self.coordinator.token, "linux")
                 self.assertEqual(join.count("http://" + host + ":5211/join.sh"), 2)
                 self.assertNotIn("https:", join)
                 self.assertNotIn("pinnedpubkey", join)
                 self.assertNotIn("github", join)
                 self.assertTrue(join.endswith("sh -s -- {} 5211 5212 {}".format(server, self.coordinator.token)))
+
+    def test_auto_join_downloads_only_shell_script_and_preserves_exit_status(self):
+        shells = [shutil.which(name) for name in ("sh", "bash", "dash")]
+        shells = list(dict.fromkeys(shell for shell in shells if shell))
+        if not shells or not shutil.which("curl"):
+            self.skipTest("需要 Shell 和 curl 执行本地 HTTP 接入")
+        script = Path(self.directory.name) / "client.sh"
+        self.args.client_script = str(script)
+        for shell in shells:
+            for status in (0, 23):
+                script.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit {}\n'.format(status), encoding="utf-8")
+                code = MODULE.join_command(self.args, self.coordinator.token)
+                for mode in ("command", "stdin"):
+                    with self.subTest(shell=shell, status=status, mode=mode):
+                        arguments = [shell, "-c", code] if mode == "command" else [shell]
+                        # 保留原始 LF，避免 Windows 文本管道把换行改成 CRLF。
+                        data = (code + "\n").encode("utf-8") if mode == "stdin" else None
+                        result = subprocess.run(arguments, input=data, capture_output=True, timeout=15)
+                        output, error = result.stdout.decode("utf-8"), result.stderr.decode("utf-8")
+                        self.assertEqual(result.returncode, status, output + error)
+                        self.assertEqual(output.splitlines(), [self.args.server, str(self.args.control_port),
+                                                             str(self.args.iperf_port), self.coordinator.token])
+                        self.assertEqual(error, "")
 
 
 if __name__ == "__main__":

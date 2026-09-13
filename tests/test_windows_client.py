@@ -109,7 +109,7 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.addCleanup(self.coordinator.close)
 
     def launch(self, code=None):
-        code = code or MODULE.join_command(self.args, self.coordinator.token, "windows")
+        code = code or MODULE.join_command(self.args, self.coordinator.token)
         code = "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n$ErrorActionPreference = 'Stop'\n" + code
         encoded = base64.b64encode(code.encode("utf-16-le")).decode("ascii")
         process = subprocess.Popen([self.shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
@@ -188,6 +188,23 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertIn("Windows 接入完成", output)
 
+    def test_explicit_windows_command_remains_supported(self):
+        status, output = self.run_client(MODULE.join_command(self.args, self.coordinator.token, "windows"))
+        self.assertEqual(status, 0, output)
+        self.coordinator.firewall.pair.assert_called_once_with("127.0.0.1")
+
+    def test_auto_join_from_standard_input_pairs_and_finishes(self):
+        code = "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n"
+        code += "$ErrorActionPreference = 'Stop'\n" + MODULE.join_command(self.args, self.coordinator.token) + "\n"
+        process = subprocess.Popen([self.shell, "-NoProfile", "-NonInteractive", "-Command", "-"],
+                                   env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        self.addCleanup(self.stop_client, process)
+        output = process.communicate(code, timeout=25)[0]
+        self.assertEqual(process.returncode, 0, output)
+        self.assertIn("Windows 接入完成", output)
+        self.coordinator.firewall.pair.assert_called_once_with("127.0.0.1")
+
     def test_missing_binary_uses_winget_and_finds_new_install_without_path_refresh(self):
         self.binary.rename(self.bin / "winget.exe")
         code, output = self.run_client()
@@ -230,7 +247,7 @@ class WindowsPowerShell51Tests(unittest.TestCase):
     def test_hard_stop_kills_child_and_releases_client_lock(self):
         self.env["TCPFIT_TEST_MODE"] = "hang"
         self.coordinator.next_job.return_value = "RUN {} 2 1".format(secrets.token_hex(8))
-        join = MODULE.join_command(self.args, self.coordinator.token, "windows")
+        join = MODULE.join_command(self.args, self.coordinator.token)
         process = self.launch(join)
         marker = self.root / "child.pid"
         deadline = time.monotonic() + 10
