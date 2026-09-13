@@ -247,7 +247,8 @@ class WindowsPowerShell51Tests(unittest.TestCase):
     def test_hard_stop_kills_child_and_releases_client_lock(self):
         self.env["TCPFIT_TEST_MODE"] = "hang"
         self.coordinator.next_job.return_value = "RUN {} 2 1".format(secrets.token_hex(8))
-        join = MODULE.join_command(self.args, self.coordinator.token)
+        token = self.coordinator.token
+        join = MODULE.join_command(self.args, token)
         process = self.launch(join)
         marker = self.root / "child.pid"
         deadline = time.monotonic() + 10
@@ -256,7 +257,9 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         if not marker.exists():
             self.stop_client(process)
             self.fail("替代测速进程未启动")
-        duplicate, output = self.run_client(join)
+        # 短链接在配对后失效；本地脚本直接启动仍由客户端任务锁拦截。
+        values = (ROOT / "tcpfit-client.ps1", self.args.server, self.args.control_port, self.args.iperf_port, token)
+        duplicate, output = self.run_client("& " + " ".join(map(ps_quote, values)))
         self.assertNotEqual(duplicate, 0, output)
         self.assertIn("已有测速端任务", output)
         self.assertIsNone(self.coordinator.error)

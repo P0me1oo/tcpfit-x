@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.17.0"
+VERSION = "0.18.1"
 MIB = 1048576
 BUFFER_MAX_BYTES = 2147483647
 BUFFER_MIN_STEP = MIB
@@ -916,17 +916,37 @@ class Coordinator:
                 self.last_seen = time.monotonic()
             return bool(good)
 
+    def pairing_error(self, authorization):
+        """由持锁的下载和配对入口共用，下载脚本不会消耗配对机会。"""
+        if self.closed or self.finished is not None:
+            return 410, "本任务已经结束，临时凭据已撤销"
+        if self.peer:
+            return 409, "本任务已绑定一个测速端，不能重复接入或更换测速端"
+        if time.monotonic() > self.expires:
+            return 410, "临时 token 已过期，请重新启动优化线路调优"
+        if not self.token or not hmac.compare_digest(authorization.encode("utf-8"), ("Pair " + self.token).encode("ascii")):
+            return 403, "认证失败：临时 token 不正确"
+        return None
+
+    def join_script(self, token, extension):
+        with self.lock:
+            error = self.pairing_error("Pair " + token)
+            if error:
+                return error
+            values = (self.args.server, self.args.control_port, self.args.iperf_port, token)
+            if extension == "sh":
+                script = Path(self.args.client_script).read_text(encoding="utf-8-sig")
+                return 200, "set -- {}\n{}".format(" ".join(shlex.quote(str(value)) for value in values), script)
+            script = windows_client_script(self.args).read_text(encoding="utf-8-sig")
+            return 200, "\ufeff& {{\n{}\n}} {}".format(script, " ".join(powershell_quote(value) for value in values))
+
     def pair(self, authorization, address, version):
         with self.lock:
-            if self.closed or self.finished is not None:
-                return 410, "本任务已经结束，临时凭据已撤销"
-            if self.peer:
-                return 409, "本任务已绑定一个测速端，不能重复接入或更换测速端"
-            if time.monotonic() > self.expires:
-                return 410, "临时 token 已过期，请重新启动优化线路调优"
-            if not self.token or not hmac.compare_digest(authorization.encode("utf-8"), ("Pair " + self.token).encode("ascii")):
-                log("接入认证失败：临时 token 不正确")
-                return 403, "认证失败：临时 token 不正确"
+            error = self.pairing_error(authorization)
+            if error:
+                if error[0] == 403:
+                    log("接入认证失败：临时 token 不正确")
+                return error
             if version != VERSION:
                 return 409, "测速端脚本版本与调优端不一致，请重新复制接入命令"
             try:
@@ -1138,6 +1158,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "")
         authenticated = coordinator.authenticate(authorization, address)
         try:
+            match = re.fullmatch(r"/j/([a-zA-Z0-9_-]{32})\.(sh|ps1)", self.path)
+            if not post and match:
+                status, response = coordinator.join_script(match[1], match[2])
+                return self.reply(status, response)
             if not post and self.path == "/join.sh":
                 return self.reply(200, Path(coordinator.args.client_script).read_bytes(), "text/x-shellscript")
             if not post and self.path == "/join.ps1":
@@ -2003,31 +2027,27 @@ def windows_client_script(args):
     return Path(args.client_script).with_name("tcpfit-client.ps1")
 
 
+def powershell_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def join_command(args, token, platform="auto"):
     if platform == "auto":
-        # PowerShell 把 Shell 分支视为块注释；Shell 把 PowerShell 分支视为不展开的 here-doc。
+        # PowerShell 用块注释跳过 Shell 分支；Shell 用行注释跳过后面的 PowerShell 分支。
         # 下载和执行放在子 Shell 中，保留客户端退出码，且不会退出用户的终端。
-        # 空行让 PowerShell 逐行读取时结束前面的多行语句。
-        return ("echo `# <#` >/dev/null\n"
-                "( " + join_command(args, token, "linux") + "; ) <<'#TCPFIT_POWERSHELL'\n"
-                "#> | Out-Null\n\n" + join_command(args, token, "windows") + "\n"
-                "#TCPFIT_POWERSHELL")
+        return ("echo `# <#` >/dev/null;" + join_command(args, token, "linux") +
+                ";#> | Out-Null;" + join_command(args, token, "windows"))
     host = "[{}]".format(args.server) if args.family == 6 else args.server
+    base = "http://{}:{}/j/{}".format(host, args.control_port, token)
     if platform == "windows":
-        quote = lambda value: "'" + str(value).replace("'", "''") + "'"
-        direct = quote("http://{}:{}/join.ps1".format(host, args.control_port))
-        values = " ".join(quote(value) for value in (args.server, args.control_port, args.iperf_port, token))
-        # 在独立作用域中下载、按 UTF-8 解码并执行，兼容 PowerShell 5.1/7。
-        return ("& { $w = New-Object Net.WebClient; $w.Proxy = $null; $w.Encoding = [Text.Encoding]::UTF8; "
-                "try { & ([scriptblock]::Create($w.DownloadString(" + direct + "))) " + values +
-                " } finally { $w.Dispose() } }")
+        # 接入脚本带 UTF-8 BOM，兼容 PowerShell 5.1/7 的 WebClient 解码。
+        return ("&{$w=[Net.WebClient]::new();$w.Proxy=$null;try{iex($w.DownloadString(" +
+                powershell_quote(base + ".ps1") + "))}finally{$w.Dispose()}}")
     if platform != "linux":
         raise ValueError("未知测速端平台: " + platform)
-    direct = shlex.quote("http://{}:{}/join.sh".format(host, args.control_port))
-    values = [args.server, str(args.control_port), str(args.iperf_port), token]
-    # 两种下载工具都直接获取调优端提供的同版本脚本，无需发布标签或证书。
-    return "(curl -fsS --noproxy '*' {} || wget -qO- {}) | sh -s -- {}".format(
-        direct, direct, " ".join(shlex.quote(value) for value in values))
+    # URL 只写一次；完整下载成功后才执行，回退下载会丢弃 curl 的残缺输出。
+    return ("(u=" + shlex.quote(base + ".sh") + ";s=$(curl -fsS --noproxy '*' \"$u\")||"
+            "s=$(wget -qO- \"$u\")||exit;printf %s \"$s\"|sh)")
 
 
 def reference_bandwidth(server_bw, client_bw):

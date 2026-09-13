@@ -62,6 +62,44 @@ class HttpTransportTests(unittest.TestCase):
         self.assertIsNone(self.coordinator.peer)
         self.firewall.pair.assert_not_called()
 
+    def test_join_script_requires_current_token_and_download_does_not_consume_it(self):
+        token = self.coordinator.token
+        invalid = ("a" if token[0] != "a" else "b") + token[1:]
+        for extension in ("sh", "ps1"):
+            with self.subTest(extension=extension):
+                status, rejected = self.request("GET", "/j/{}.{}".format(invalid, extension))
+                self.assertEqual(status, 403)
+                self.assertNotIn(token.encode("ascii"), rejected)
+                path = "/j/{}.{}".format(token, extension)
+                status, script = self.request("GET", path)
+                self.assertEqual(status, 200)
+                self.assertIn(token.encode("ascii"), script)
+                self.assertIn(str(self.args.control_port).encode("ascii"), script)
+                self.assertIn((ROOT / ("tcpfit-client." + extension)).read_text(encoding="utf-8-sig"),
+                              script.decode("utf-8"))
+                self.assertEqual(self.request("GET", path), (status, script))
+        self.assertEqual(self.coordinator.token, token)
+        self.assertIsNone(self.coordinator.peer)
+        self.firewall.pair.assert_not_called()
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+
+    def test_join_script_rejects_expired_finished_closed_and_paired_tasks(self):
+        token = self.coordinator.token
+        paths = ["/j/{}.{}".format(token, extension) for extension in ("sh", "ps1")]
+        for name, value in (("expires", time.monotonic() - 1), ("finished", "OK"), ("closed", True)):
+            with self.subTest(state=name), mock.patch.object(self.coordinator, name, value):
+                for path in paths:
+                    status, script = self.request("GET", path)
+                    self.assertEqual(status, 410)
+                    self.assertNotIn(token.encode("ascii"), script)
+        self.assertEqual(self.request("POST", "/pair", {
+            "Authorization": "Pair " + token, "X-Tcpfit-Version": MODULE.VERSION})[0], 200)
+        for path in paths:
+            status, script = self.request("GET", path)
+            self.assertEqual(status, 409)
+            self.assertNotIn(token.encode("ascii"), script)
+        self.assertIsNone(self.coordinator.error)
+
     def test_latency_only_requests_collect_samples_without_starting_iperf(self):
         status, response = self.request("POST", "/pair", {
             "Authorization": "Pair " + self.coordinator.token, "X-Tcpfit-Version": MODULE.VERSION})
@@ -138,16 +176,18 @@ class HttpTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.TaskError, "调优模块版本不一致"):
                 MODULE.validate_environment(args)
 
-    def test_join_command_uses_direct_http_and_four_arguments(self):
+    def test_join_command_uses_one_direct_url_per_platform(self):
         for family, server, host in ((4, "192.0.2.1", "192.0.2.1"), (6, "2001:db8::1", "[2001:db8::1]")):
             with self.subTest(family=family):
                 args = types.SimpleNamespace(family=family, server=server, control_port=5211, iperf_port=5212)
-                join = MODULE.join_command(args, self.coordinator.token, "linux")
-                self.assertEqual(join.count("http://" + host + ":5211/join.sh"), 2)
-                self.assertNotIn("https:", join)
-                self.assertNotIn("pinnedpubkey", join)
-                self.assertNotIn("github", join)
-                self.assertTrue(join.endswith("sh -s -- {} 5211 5212 {}".format(server, self.coordinator.token)))
+                self.assertEqual(len(MODULE.join_command(args, self.coordinator.token).splitlines()), 1)
+                for platform, extension in (("linux", "sh"), ("windows", "ps1")):
+                    join = MODULE.join_command(args, self.coordinator.token, platform)
+                    url = "http://{}:5211/j/{}.{}".format(host, self.coordinator.token, extension)
+                    self.assertEqual(join.count(url), 1)
+                    self.assertEqual(join.count(self.coordinator.token), 1)
+                    self.assertNotIn("https:", join)
+                    self.assertNotIn("github", join)
 
     def test_auto_join_downloads_only_shell_script_and_preserves_exit_status(self):
         shells = [shutil.which(name) for name in ("sh", "bash", "dash")]
@@ -171,6 +211,22 @@ class HttpTransportTests(unittest.TestCase):
                         self.assertEqual(output.splitlines(), [self.args.server, str(self.args.control_port),
                                                              str(self.args.iperf_port), self.coordinator.token])
                         self.assertEqual(error, "")
+
+    def test_shell_join_rejects_failed_download_and_discards_partial_curl_output(self):
+        shells = list(dict.fromkeys(shell for shell in (shutil.which(name) for name in ("sh", "bash", "dash")) if shell))
+        if not shells:
+            self.skipTest("需要 Shell 检查下载失败与回退")
+        partial = "curl(){ printf 'this is incomplete shell code ('; return 23; }\n"
+        fallback = "wget(){ printf 'printf fallback; exit 7\\n'; }\n"
+        for shell in shells:
+            for downloader, expected, output in (("wget(){ return 8; }\n", 8, b""),
+                                                  (fallback, 7, b"fallback")):
+                with self.subTest(shell=shell, status=expected):
+                    code = partial + downloader + MODULE.join_command(self.args, self.coordinator.token)
+                    result = subprocess.run([shell, "-c", code], capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, output)
+                    self.assertEqual(result.stderr, b"")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.17.0"
+VERSION="0.18.1"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -660,6 +660,18 @@ format_mib(){
     v=bytes/1048576
     if(v==int(v))printf "%.0f MiB",v; else printf "%.2f MiB",v
   }'
+}
+
+# 菜单读取内核实际生效的 TCP 上限；读取失败时显示未知，不借用另一方向的值。
+read_tcp_buffer_max(){
+  local raw values=()
+  raw=$(sysctl -n "$1" 2>/dev/null) || raw=""
+  read -r -a values <<<"$raw"
+  if [ "${#values[@]}" = 3 ] && is_posint "${values[2]}" 1 2147483647; then
+    format_mib "${values[2]}"
+  else
+    printf '?'
+  fi
 }
 
 # 只更新六项缓冲区参数。子 shell 独立管理中断与失败恢复，不覆盖调用者的 trap。
@@ -3404,11 +3416,13 @@ _item(){ # _item <编号> <中文> <英文> [耗时]
 }
 
 banner(){
-  local iface cc shaper ram cores tuned
+  local iface cc shaper ram cores tuned rmem wmem
   iface=$(detect_iface)
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   shaper=$(r=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") && echo "${r}Mbit")
   ram=$(detect_ram_mb); cores=$(detect_cores)
+  rmem=$(read_tcp_buffer_max net.ipv4.tcp_rmem)
+  wmem=$(read_tcp_buffer_max net.ipv4.tcp_wmem)
   [ -f "$SYSCTL_FILE" ] && tuned="Tuned" || tuned="Stock"
   clear 2>/dev/null || true
   echo
@@ -3434,7 +3448,7 @@ banner(){
   _row "  11. 卸载 tcpfit / Uninstall"
   _bot
   printf "  %-9s %s core / %s MB / %s\n" "Machine" "$cores" "$ram" "$(uname -r)"
-  printf "  %-9s cc=%s  shaper=%s  " "Network" "${cc:-?}" "${shaper:-none}"
+  printf "  %-9s cc=%s  shaper=%s  buf(rx/tx)=%s/%s  " "Network" "${cc:-?}" "${shaper:-none}" "$rmem" "$wmem"
   [ "$tuned" = Tuned ] && printf "${green}%s${plain}\n" "$tuned" || printf "${yellow}%s${plain}\n" "$tuned"
   local _stats; _stats=$(telemetry_line)
   [ -n "$_stats" ] && printf "  %-9s %s\n" "Runs" "$_stats"
