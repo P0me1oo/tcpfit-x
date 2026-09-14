@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.18.2"
+VERSION = "0.18.3"
 MIB = 1048576
 BUFFER_MAX_BYTES = 2147483647
 BUFFER_MIN_STEP = MIB
@@ -254,7 +254,7 @@ class QueueState:
     """按 tc 的可重放参数保存队列；不猜测未知结构的恢复方法。"""
 
     OPTIONS = {
-        "fq": {"limit", "flow_limit", "buckets", "orphan_mask", "quantum", "initial_quantum", "maxrate", "low_rate_threshold", "refill_delay", "timer_slack", "horizon", "ce_threshold", "weights", "priomap"},
+        "fq": {"limit", "flow_limit", "buckets", "orphan_mask", "quantum", "initial_quantum", "maxrate", "low_rate_threshold", "refill_delay", "timer_slack", "horizon", "ce_threshold", "bands", "weights", "priomap"},
         "fq_codel": {"limit", "flows", "quantum", "target", "interval", "memory_limit", "ce_threshold", "drop_batch"},
         "pfifo_fast": {"bands", "priomap"},
         "htb": {"default", "r2q", "direct_qlen"},
@@ -302,6 +302,25 @@ class QueueState:
             output.append("noecn")
         return output
 
+    @staticmethod
+    def replay_options(kind, options):
+        if kind != "fq" or not any(key in options for key in ("bands", "priomap", "weights")):
+            return list(options)
+        candidates = [list(options)]
+        if "weights" in options:
+            index = options.index("weights") + 1
+            if len(options[index:index + 3]) != 3:
+                raise TaskError("fq weights 参数不完整，未修改网络参数")
+            # 部分 tc（包括 iproute2 6.15）多推进一次参数，跳过首个权重。
+            # 只在执行命令时补一个重复值，快照仍保存内核的三个实际权重。
+            candidates.append(options[:index] + [options[index]] + options[index:])
+        for candidate in candidates:
+            # 不指定网卡并以 help 结束，只检查解析器，不发送队列修改请求。
+            probe = command(["tc", "qdisc", "add", "fq"] + candidate + ["help"], check=False)
+            if probe.returncode == 1 and probe.stderr.startswith("Usage: ... fq"):
+                return candidate
+        raise TaskError("当前 tc 无法完整解析 fq 恢复参数，未修改网络参数")
+
     @classmethod
     def capture(cls, iface):
         raw = command(["tc", "qdisc", "show", "dev", iface]).stdout
@@ -322,7 +341,9 @@ class QueueState:
                 parent, rest = words[4], words[5:]
             else:
                 raise TaskError("无法识别队列层级，未修改网络参数")
-            entries.append({"kind": kind, "handle": handle, "parent": parent, "options": cls.parse_options(kind, rest)})
+            options = cls.parse_options(kind, rest)
+            cls.replay_options(kind, options)
+            entries.append({"kind": kind, "handle": handle, "parent": parent, "options": options})
         roots = [entry for entry in entries if entry["parent"] == "root"]
         if len(roots) != 1:
             raise TaskError("无法确定唯一出口根队列，未修改网络参数")
@@ -333,7 +354,8 @@ class QueueState:
                 raise TaskError("pfifo_fast 不是可重建的内核默认参数，未修改网络参数")
         class_entries, rate = [], None
         for line in classes.splitlines():
-            words = line.split()
+            # 部分 tc 将 burst/cburst 的 /cell 与 mpu 连写，先补回字段分隔。
+            words = re.sub(r"(\b(?:burst|cburst)\s+\S+)mpu\b", r"\1 mpu", line).split()
             if root["kind"] == "mq" and len(words) > 1 and words[1] == "mq":
                 continue
             if len(words) < 6 or words[:2] != ["class", "htb"]:
@@ -414,7 +436,8 @@ class QueueState:
     @staticmethod
     def restore(state):
         iface, entries = state["iface"], state["qdiscs"]
-        root = next(entry for entry in entries if entry["parent"] == "root")
+        replay = [(entry, QueueState.replay_options(entry["kind"], entry["options"])) for entry in entries]
+        root, root_options = next((entry, options) for entry, options in replay if entry["parent"] == "root")
         command(["tc", "qdisc", "del", "dev", iface, "root"], check=False)
         current = command(["tc", "qdisc", "show", "dev", iface]).stdout
         old_major = root["handle"].split(":")[0]
@@ -448,10 +471,10 @@ class QueueState:
         args = ["tc", "qdisc", "replace", "dev", iface, "root"]
         if root_handle != "0:":
             args += ["handle", root_handle]
-        command(args + [root["kind"]] + root["options"])
+        command(args + [root["kind"]] + root_options)
         for item in state["classes"]:
             command(["tc", "class", "replace", "dev", iface, "parent", item["parent"], "classid", item["handle"], "htb"] + item["options"])
-        for item in entries:
+        for item, options in replay:
             if item["parent"] == "root":
                 continue
             parent = item["parent"]
@@ -460,7 +483,7 @@ class QueueState:
             args = ["tc", "qdisc", "replace", "dev", iface, "parent", parent]
             if item["handle"] != "0:":
                 args += ["handle", item["handle"]]
-            command(args + [item["kind"]] + item["options"])
+            command(args + [item["kind"]] + options)
 
 
 class Snapshot:

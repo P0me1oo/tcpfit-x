@@ -237,12 +237,73 @@ class DecisionTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    MODERN_FQ = (
+        "qdisc fq 8001: root refcnt 2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 "
+        "bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 weights 589824 196608 65536 "
+        "quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40ms "
+        "timer_slack 10us horizon 10s horizon_drop\n"
+    )
+
     def capture(self, qdisc, classes="", filters=""):
         def run(args, **kwargs):
+            if args[-1] == "help":
+                return subprocess.CompletedProcess(args, 1, "", "Usage: ... fq\n")
             output = qdisc if "qdisc" in args else classes if "class" in args else filters
             return subprocess.CompletedProcess(args, 0, output, "")
         with mock.patch.object(MODULE, "command", side_effect=run):
             return MODULE.QueueState.capture("eth0")
+
+    def test_modern_fq_parameters_are_preserved(self):
+        state = self.capture(self.MODERN_FQ)
+        expected = (
+            "limit 10000 flow_limit 100 buckets 1024 orphan_mask 1023 "
+            "bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 weights 589824 196608 65536 "
+            "quantum 3028 initial_quantum 15140 low_rate_threshold 550Kbit refill_delay 40ms "
+            "timer_slack 10us horizon 10s horizon_drop"
+        ).split()
+        self.assertEqual(state["qdiscs"][0]["options"], expected)
+
+    def test_modern_fq_replay_supports_both_weights_parsers(self):
+        for leaf in (False, True):
+            for skips_first in (False, True):
+                with self.subTest(leaf=leaf, skips_first=skips_first):
+                    raw = "qdisc mq 1: root\n" + self.MODERN_FQ.replace("root", "parent 1:1") if leaf else self.MODERN_FQ
+                    state = self.capture(raw, "class mq 1:1 root\n" if leaf else "")
+                    original = copy.deepcopy(state)
+                    expected = list(state["qdiscs"][-1]["options"])
+                    if skips_first:
+                        index = expected.index("weights") + 1
+                        expected.insert(index, expected[index])
+                    calls = []
+                    def run(args, **kwargs):
+                        calls.append(args)
+                        if args[-1] == "help":
+                            self.assertEqual(args[:4], ["tc", "qdisc", "add", "fq"])
+                            self.assertNotIn("dev", args)
+                            error = "Usage: ... fq\n" if args[4:-1] == expected else 'Illegal "weights" element\n'
+                            return subprocess.CompletedProcess(args, 1, "", error)
+                        return subprocess.CompletedProcess(args, 0, "", "")
+                    with mock.patch.object(MODULE, "command", side_effect=run):
+                        MODULE.QueueState.restore(state)
+                    replay = next(args for args in calls if "replace" in args and "fq" in args)
+                    self.assertEqual(replay[replay.index("fq") + 1:], expected)
+                    first_delete = next(index for index, args in enumerate(calls) if "del" in args)
+                    self.assertGreater(first_delete, 0)
+                    self.assertTrue(all(args[-1] == "help" for args in calls[:first_delete]))
+                    self.assertEqual(state, original)
+
+    def test_modern_fq_parser_rejection_stops_before_mutation(self):
+        state = self.capture(self.MODERN_FQ)
+        for operation in (lambda: MODULE.QueueState.capture("eth0"), lambda: MODULE.QueueState.restore(state)):
+            calls = []
+            def run(args, **kwargs):
+                calls.append(args)
+                if args[-1] == "help":
+                    return subprocess.CompletedProcess(args, 1, "", 'What is "weights"?\nUsage: ... fq\n')
+                return subprocess.CompletedProcess(args, 0, self.MODERN_FQ if "qdisc" in args else "", "")
+            with mock.patch.object(MODULE, "command", side_effect=run), self.assertRaises(MODULE.TaskError):
+                operation()
+            self.assertTrue(all("show" in args or args[-1] == "help" for args in calls))
 
     def test_custom_fq_parameters_are_preserved(self):
         state = self.capture("qdisc fq 8001: root refcnt 2 limit 40960p flow_limit 8192p buckets 1024 orphan_mask 1023 quantum 1514b initial_quantum 15140b maxrate 1Gbit\n")
@@ -307,6 +368,19 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(options[options.index("mpu") + 1], "0")
         with self.assertRaises(MODULE.TaskError):
             self.capture(qdisc, classes.replace("ceil 1Gbit", "ceil 2Gbit"))
+
+    def test_htb_compact_mpu_output_keeps_burst_and_mpu(self):
+        qdisc = "qdisc htb 1: root r2q 10 default 0x10\nqdisc fq 10: parent 1:10 limit 10000p\n"
+        classes = "class htb 1:10 root leaf 10: prio 0 quantum 1514 rate 321Mbit ceil 321Mbit linklayer ethernet burst 160500b/1mpu 64b cburst 160500b/1mpu 64b level 0\n"
+        state = self.capture(qdisc, classes)
+        spaced = self.capture(qdisc, classes.replace("/1mpu", "/1 mpu"))
+        self.assertEqual(state["classes"], spaced["classes"])
+        options = state["classes"][0]["options"]
+        self.assertEqual(options[options.index("burst") + 1], "160500b/1")
+        self.assertEqual(options[options.index("cburst") + 1], "160500b/1")
+        self.assertEqual(options[options.index("mpu") + 1], "64")
+        with self.assertRaises(MODULE.TaskError):
+            self.capture(qdisc, classes.replace("cburst 160500b/1mpu 64b", "cburst 160500b/1mpu 32b"))
 
 
 class RouteRestoreTests(unittest.TestCase):

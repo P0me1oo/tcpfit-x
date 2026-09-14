@@ -23,6 +23,8 @@ python -X utf8 -m unittest discover -s tests -p test_windows_client.py -v
 
 队列恢复回归还检查内核自动创建的零句柄队列：删除临时候选后，自动队列参数与快照相同就保留；参数不同时完整重建，避免 `tc qdisc change` 无法寻址 `fq 0:` 而误报恢复失败。
 
+新式 fq 回归使用包含 `bands 3`、16 项 `priomap` 和 3 项 `weights` 的完整输出，检查根队列和 mq 叶子的参数保留。模拟标准 tc 和跳过首个权重值的 tc，验证恢复前的纯解析检查、兼容命令与快照分离、解析失败时不删除原队列；Linux 隔离测试再通过内核 JSON 输出核对自定义优先级映射和实际权重，并验证完整恢复。HTB 回归覆盖 `/cell` 与 `mpu` 连写、非零最小包长度，以及重复 `mpu` 不一致时拒绝恢复。
+
 缓冲区回归以临时文件模拟内核参数，执行真实配置写入与失败恢复，覆盖自定义上限和默认值、单位换算、无效输入、现有参数保留、内核拒绝或截断、保存失败和中断。优化线路调优试调使用模拟测量验证以下行为：
 
 - 优化线路调优 `1.5 × BDP` 初值和 `2.5 × BDP` 上限，取消固定余量、6 MiB 下限及按内存计算的缓冲区上限；覆盖低带宽、低延迟、整数字节取整、默认值收小、超过原 256 MiB 范围和内核整数范围拒绝。后续下调受实际 TCP 最小值约束。普通基础调优仍使用 `1.5 × BDP + 2 MiB` 和 4 MiB 下限，512 MiB 档限制、相邻档单调性、角色默认值和 TCP 全局内存预算保持原规则。
@@ -42,6 +44,14 @@ python -X utf8 -m unittest discover -s tests -p test_windows_client.py -v
 HTTP 协议回归检查 IPv4/IPv6 下均分别显示两类接入命令，并标明 Linux / OpenWrt / iStoreOS 和 Windows PowerShell 5.1/7。每条都是单行，只包含一份 URL 和 token，不混入另一系统的执行分支，且不包含 `sudo`、Bash 或 Python 启动依赖。在本机已有的 sh、Bash、dash 中，Linux 命令直接执行或通过标准输入传入时，均通过真实 IPv4/IPv6 HTTP 下载 Shell 脚本，由服务器准确补齐四个参数，并保留成功和失败退出码；临时目录不提供 PowerShell 脚本，用于检查未下载错误文件。短链接还检查错误 token、过期、已结束、已关闭和已配对任务的拒绝行为，重复下载不会消耗配对机会，不生成凭据文件；原有 `/join.sh`、`/join.ps1` 仍可下载不含参数的原始脚本。替代下载工具用可执行的残缺内容验证 curl 失败时丢弃内容并回退 wget，两次下载均失败时不执行脚本。纯延迟任务不会启动 iperf3，重复组的采样结果有独立编号且正确保存；不接受该任务的吞吐或满载延迟回报，关闭纯延迟任务无需结束测速进程。
 
 自动测试的数据只用于验证程序行为，不能作为线路优化效果的证据。
+
+### 0.18.3 本地及 Linux 队列验证（2026-09-15）
+
+Windows 本机执行 `python -B -X utf8 -m unittest discover -s tests -v`，共 225 项，耗时 201.665 秒：207 项通过，18 项 Linux 隔离集成测试按平台和启用条件跳过。补充 HTB 连写格式兼容后，在 `tests` 目录执行 `python -B -X utf8 -m unittest test_return test_return_records -q`，53 项全部通过，耗时 3.325 秒。
+
+Debian 13、内核 `6.12.105+deb13-cloud-amd64`、iproute2 6.15.0 环境中，使用修复模块的临时副本成功读取实际出口 fq 配置。在 `unshare --net` 隔离网络中执行 11 项队列单元测试和 5 项真实恢复测试，16 项全部通过，耗时 0.363 秒。真实测试覆盖 HTB + fq、fq_codel、限速 fq、定制 fq 优先级与权重、mq 各叶子；自定义参数额外与内核 JSON 输出逐项核对。验证前后实际出口队列输出一致。
+
+Python、Git for Windows 的 Shell 和 PowerShell 语法检查、五个发布文件的 SHA-256 校验及 `git diff --check` 均通过。四个运行模块统一为 0.18.3，保持 UTF-8、LF 换行，Windows 测速脚本保留 UTF-8 BOM。本轮未执行家宽接入或实际线路测速，服务器已安装的程序未替换。
 
 ### 0.18.2 本地验证（2026-09-14）
 

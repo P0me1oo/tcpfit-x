@@ -71,6 +71,27 @@ class LinuxIntegrationTests(unittest.TestCase):
         self.assertIsNone(before["rate"])
         self.check_roundtrip()
 
+    def test_fq_bands_and_custom_weights_roundtrip(self):
+        MODULE.command(["tc", "qdisc", "replace", "dev", "tf-test0", "root", "handle", "2:", "fq"])
+        reported = json.loads(MODULE.command(["tc", "-j", "qdisc", "show", "dev", "tf-test0"]).stdout)[0]["options"]
+        if "bands" not in reported:
+            self.skipTest("当前内核或 tc 不提供 fq bands/weights")
+        before = MODULE.QueueState.capture("tf-test0")
+        options = before["qdiscs"][0]["options"]
+        priomap = [2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0, 2]
+        weights = [262144, 131072, 65536]
+        index = options.index("priomap") + 1
+        options[index:index + 16] = [str(value) for value in priomap]
+        index = options.index("weights") + 1
+        options[index:index + 3] = [str(value) for value in weights]
+        MODULE.QueueState.restore(before)
+        reported = json.loads(MODULE.command(["tc", "-j", "qdisc", "show", "dev", "tf-test0"]).stdout)[0]["options"]
+        reported = {key.strip(): value for key, value in reported.items()}
+        self.assertEqual(reported["bands"], 3)
+        self.assertEqual(reported["priomap"], priomap)
+        self.assertEqual(reported["weights"], weights)
+        self.check_roundtrip()
+
     def test_mq_individual_leaves_roundtrip(self):
         MODULE.command(["tc", "qdisc", "replace", "dev", "tf-test0", "root", "handle", "1:", "mq"])
         MODULE.command(["tc", "qdisc", "replace", "dev", "tf-test0", "parent", "1:1", "handle", "11:", "fq", "limit", "4321"])
