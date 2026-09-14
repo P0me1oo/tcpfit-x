@@ -1,6 +1,7 @@
 """通过真实 HTTP 请求检查接入脚本、一次性配对和版本隔离。"""
 import http.client
 import importlib.util
+import io
 from pathlib import Path
 import shutil
 import subprocess
@@ -176,53 +177,68 @@ class HttpTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.TaskError, "调优模块版本不一致"):
                 MODULE.validate_environment(args)
 
-    def test_join_command_uses_one_direct_url_per_platform(self):
+    def test_each_platform_displays_its_own_single_line_join_command(self):
         for family, server, host in ((4, "192.0.2.1", "192.0.2.1"), (6, "2001:db8::1", "[2001:db8::1]")):
             with self.subTest(family=family):
                 args = types.SimpleNamespace(family=family, server=server, control_port=5211, iperf_port=5212)
-                self.assertEqual(len(MODULE.join_command(args, self.coordinator.token).splitlines()), 1)
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                    MODULE.print_join_commands(args, self.coordinator.token)
+                lines = output.getvalue().splitlines()
+                self.assertIn("Linux / OpenWrt / iStoreOS：", lines)
+                self.assertIn("Windows PowerShell 5.1/7：", lines)
+                self.assertEqual(sum("http://" in line for line in lines), 2)
                 for platform, extension in (("linux", "sh"), ("windows", "ps1")):
                     join = MODULE.join_command(args, self.coordinator.token, platform)
+                    self.assertEqual(len(join.splitlines()), 1)
+                    self.assertEqual(lines.count(join), 1)
                     url = "http://{}:5211/j/{}.{}".format(host, self.coordinator.token, extension)
                     self.assertEqual(join.count(url), 1)
+                    self.assertEqual(join.count("http://"), 1)
                     self.assertEqual(join.count(self.coordinator.token), 1)
                     self.assertNotIn("https:", join)
                     self.assertNotIn("github", join)
+                    self.assertNotRegex(join, r"(^|[;| (])(?:sudo|bash|python)(?:\s|$)")
+                    self.assertNotIn("<#", join)
 
-    def test_auto_join_downloads_only_shell_script_and_preserves_exit_status(self):
+    def test_linux_join_downloads_only_shell_script_and_preserves_exit_status(self):
         shells = [shutil.which(name) for name in ("sh", "bash", "dash")]
         shells = list(dict.fromkeys(shell for shell in shells if shell))
         if not shells or not shutil.which("curl"):
             self.skipTest("需要 Shell 和 curl 执行本地 HTTP 接入")
         script = Path(self.directory.name) / "client.sh"
         self.args.client_script = str(script)
-        for shell in shells:
-            for status in (0, 23):
-                script.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit {}\n'.format(status), encoding="utf-8")
-                code = MODULE.join_command(self.args, self.coordinator.token)
-                for mode in ("command", "stdin"):
-                    with self.subTest(shell=shell, status=status, mode=mode):
-                        arguments = [shell, "-c", code] if mode == "command" else [shell]
-                        # 保留原始 LF，避免 Windows 文本管道把换行改成 CRLF。
-                        data = (code + "\n").encode("utf-8") if mode == "stdin" else None
-                        result = subprocess.run(arguments, input=data, capture_output=True, timeout=15)
-                        output, error = result.stdout.decode("utf-8"), result.stderr.decode("utf-8")
-                        self.assertEqual(result.returncode, status, output + error)
-                        self.assertEqual(output.splitlines(), [self.args.server, str(self.args.control_port),
-                                                             str(self.args.iperf_port), self.coordinator.token])
-                        self.assertEqual(error, "")
+        for family, server in ((4, "127.0.0.1"), (6, "::1")):
+            self.coordinator.close()
+            self.args.family, self.args.server, self.args.control_port = family, server, 0
+            self.coordinator = MODULE.Coordinator(self.args, self.directory.name, self.directory.name, self.firewall)
+            MODULE.start_http(self.coordinator)
+            for shell in shells:
+                for status in (0, 23):
+                    script.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit {}\n'.format(status), encoding="utf-8")
+                    code = MODULE.join_command(self.args, self.coordinator.token, "linux")
+                    for mode in ("command", "stdin"):
+                        with self.subTest(family=family, shell=shell, status=status, mode=mode):
+                            arguments = [shell, "-c", code] if mode == "command" else [shell]
+                            # 保留原始 LF，避免 Windows 文本管道把换行改成 CRLF。
+                            data = (code + "\n").encode("utf-8") if mode == "stdin" else None
+                            result = subprocess.run(arguments, input=data, capture_output=True, timeout=15)
+                            output, error = result.stdout.decode("utf-8"), result.stderr.decode("utf-8")
+                            self.assertEqual(result.returncode, status, output + error)
+                            self.assertEqual(output.splitlines(), [self.args.server, str(self.args.control_port),
+                                                                 str(self.args.iperf_port), self.coordinator.token])
+                            self.assertEqual(error, "")
 
     def test_shell_join_rejects_failed_download_and_discards_partial_curl_output(self):
         shells = list(dict.fromkeys(shell for shell in (shutil.which(name) for name in ("sh", "bash", "dash")) if shell))
         if not shells:
             self.skipTest("需要 Shell 检查下载失败与回退")
-        partial = "curl(){ printf 'this is incomplete shell code ('; return 23; }\n"
+        partial = "curl(){ printf 'printf must-not-run\\n'; return 23; }\n"
         fallback = "wget(){ printf 'printf fallback; exit 7\\n'; }\n"
         for shell in shells:
-            for downloader, expected, output in (("wget(){ return 8; }\n", 8, b""),
+            for downloader, expected, output in (("wget(){ printf 'printf must-not-run\\n'; return 8; }\n", 8, b""),
                                                   (fallback, 7, b"fallback")):
                 with self.subTest(shell=shell, status=expected):
-                    code = partial + downloader + MODULE.join_command(self.args, self.coordinator.token)
+                    code = partial + downloader + MODULE.join_command(self.args, self.coordinator.token, "linux")
                     result = subprocess.run([shell, "-c", code], capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                     self.assertEqual(result.stdout, output)

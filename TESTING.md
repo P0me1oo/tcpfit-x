@@ -13,7 +13,7 @@ sh -n tcpfit-client.sh
 
 常规回归检查真实结果解析、错误与不完整数据拒绝、HTTP 接入、一次性配对、来源绑定、心跳中断、防火墙选择、优化线路调优单连接重传阈值、已有整形的四连接验证条件和路由恢复。入口回归覆盖服务器地址自动探测、IPv4/IPv6、外部查询失败、手动回退及数字菜单与实际操作的对应关系；使用替代命令，不请求外网或修改网络。依赖测试使用替代包管理器检查实际安装请求，不执行软件安装。Linux 集成测试默认跳过，不会在普通开发机上修改网络。
 
-Windows 会分别用已安装的 PowerShell 5.1 和 7 运行 `tests/test_windows_client.py`，需要系统的 .NET Framework C# 编译器生成临时替代程序。测试默认执行单行通用接入命令，使用仅包含临时测速工具的 PATH，验证无需 Shell、curl 或 Python；使用真实本地 HTTP、套接字和子进程，检查脚本下载与中文编码、IPv4/IPv6 配对、单连接和四连接下载参数、纯空载延迟采集、延迟回报、无效指令与测速失败、WinGet 安装后查找，以及强制关闭后的进程和任务锁清理。另行检查原有 Windows 专用命令仍可执行，并通过标准输入传入单行通用命令，验证一次回车即可配对。纯延迟任务必须回报有效样本且不启动测速子进程。替代程序只生成测试结果，不进行大流量测速或实际安装；缺少对应 PowerShell 或编译器时跳过。可以单独执行：
+Windows 会分别用已安装的 PowerShell 5.1 和 7 运行 `tests/test_windows_client.py`，需要系统的 .NET Framework C# 编译器生成临时替代程序。测试执行 Windows 单行接入命令，使用仅包含临时测速工具的 PATH，验证无需 Shell、curl 或 Python；使用真实本地 HTTP、套接字和子进程，检查脚本下载与中文编码、IPv4/IPv6 配对、单连接和四连接下载参数、纯空载延迟采集、延迟回报、无效指令与测速失败、WinGet 安装后查找，以及强制关闭后的进程和任务锁清理。接入命令须只下载一次 PowerShell 脚本，绕过不可用的默认代理，并在默认错误处理方式下拒绝过期下载；通过标准输入传入时，一次回车即可配对。纯延迟任务必须回报有效样本且不启动测速子进程。替代程序只生成测试结果，不进行大流量测速或实际安装；缺少对应 PowerShell 或编译器时跳过。可以单独执行：
 
 ```powershell
 python -X utf8 -m unittest discover -s tests -p test_windows_client.py -v
@@ -39,9 +39,17 @@ python -X utf8 -m unittest discover -s tests -p test_windows_client.py -v
 - 完整流程不读取可用内存或检查预留余量，日志不显示缓冲区默认值；优化线路缓冲区范围仅由 BDP 推导，不设 30 分钟总时限。模拟配对满一小时且心跳正常时继续工作，随后心跳超时仍明确失败。测速失败、心跳中断、参数部分应用失败和普通中断先恢复上一组缓冲区，再恢复任务前完整快照；恢复失败或实际值不一致时保留待恢复记录。
 - 临时解除限速前显示当前数值，区分总限速和 fq 单连接限速，并换算为 Mbps；无限制时显示“未设置”，不声称解除了已有上限。
 
-HTTP 协议回归检查 IPv4/IPv6 通用接入命令均为单行，并验证在本机已有的 sh、Bash、dash 中，直接执行或通过标准输入传入时均通过真实 HTTP 下载 Shell 脚本，由服务器准确补齐四个参数，并保留成功和失败退出码；临时目录不提供 PowerShell 脚本，用于检查未执行错误分支。短链接还检查错误 token、过期、已结束、已关闭和已配对任务的拒绝行为，重复下载不会消耗配对机会，不生成凭据文件；原有 `/join.sh`、`/join.ps1` 仍可下载不含参数的原始脚本。替代下载工具验证 curl 返回残缺内容时丢弃该内容并回退 wget，两次下载均失败时不执行脚本。纯延迟任务不会启动 iperf3，重复组的采样结果有独立编号且正确保存；不接受该任务的吞吐或满载延迟回报，关闭纯延迟任务无需结束测速进程。
+HTTP 协议回归检查 IPv4/IPv6 下均分别显示两类接入命令，并标明 Linux / OpenWrt / iStoreOS 和 Windows PowerShell 5.1/7。每条都是单行，只包含一份 URL 和 token，不混入另一系统的执行分支，且不包含 `sudo`、Bash 或 Python 启动依赖。在本机已有的 sh、Bash、dash 中，Linux 命令直接执行或通过标准输入传入时，均通过真实 IPv4/IPv6 HTTP 下载 Shell 脚本，由服务器准确补齐四个参数，并保留成功和失败退出码；临时目录不提供 PowerShell 脚本，用于检查未下载错误文件。短链接还检查错误 token、过期、已结束、已关闭和已配对任务的拒绝行为，重复下载不会消耗配对机会，不生成凭据文件；原有 `/join.sh`、`/join.ps1` 仍可下载不含参数的原始脚本。替代下载工具用可执行的残缺内容验证 curl 失败时丢弃内容并回退 wget，两次下载均失败时不执行脚本。纯延迟任务不会启动 iperf3，重复组的采样结果有独立编号且正确保存；不接受该任务的吞吐或满载延迟回报，关闭纯延迟任务无需结束测速进程。
 
 自动测试的数据只用于验证程序行为，不能作为线路优化效果的证据。
+
+### 0.18.2 本地验证（2026-09-14）
+
+Windows 本机在 `tests` 目录执行 `python -B -X utf8 -m unittest test_transport test_windows_client test_ports test_return_buffers -q`，117 项全部通过，无跳过，耗时 128.909 秒。sh、Bash、dash 均通过 IPv4/IPv6 下的 Linux 单行命令直接执行、标准输入、脚本参数补齐和退出码检查。PowerShell 5.1/7 均通过 Windows 单行命令的单次下载、默认代理绕过、过期下载失败退出、中文解码、配对、测速和退出清理检查。两类指令的显示、端口保留和调优流程回归均通过。
+
+固定示例地址 `192.0.2.1`、接入端口 12223 和 32 字符示例 token，Linux / OpenWrt / iStoreOS 命令为 143 字符，Windows 命令为 133 字符；IPv6 示例 `2001:db8::1` 分别为 149 和 137 字符。每条命令只包含一份 URL 和 token，不含换行或 `sudo`，按系统复制对应的一条即可。
+
+Python、Shell 和 PowerShell 语法检查、五个发布文件的 SHA-256 校验及 `git diff --check` 均通过。四个运行模块统一为 0.18.2，保持 UTF-8、LF 换行，Windows 测速脚本保留 UTF-8 BOM。本轮未执行 Linux 隔离集成、OpenWrt/iStoreOS 真机测试或实际线路测速。
 
 ### 0.18.1 本地验证（2026-09-14）
 
@@ -147,7 +155,7 @@ sudo env TCPFIT_INSTALL_INTEGRATION=1 TCPFIT_LINUX_INTEGRATION=1 \
 sudo python3 tests/peer_smoke.py --server <服务器可达地址>
 ```
 
-在另一端完整复制输出的通用接入命令、一次粘贴；Linux / OpenWrt / iStoreOS 在 Shell 中执行，Windows 在 PowerShell 中执行。该检查分别运行短时单连接和四连接下载，结束后清理自己的端口规则；不应用系统调优参数。要验证完整流程，使用 `bash tcpfit.sh return`。
+在另一端按系统复制对应的一条接入命令、一次粘贴；Linux / OpenWrt / iStoreOS 在 Shell 中执行，Windows 在 PowerShell 中执行。该检查分别运行短时单连接和四连接下载，结束后清理自己的端口规则；不应用系统调优参数。要验证完整流程，使用 `bash tcpfit.sh return`。
 
 完整实测必须另外保存服务器现状，并在测试结束后按约定保留或恢复。核对运行参数、持久化文件、队列、默认路由、服务状态以及两端的临时进程和文件。路由比较应排除自动路由剩余寿命等动态字段。测速端缺少 tc 时，可通过 `ip -d link show` 核对队列类型，不要为了检查而改它的队列。
 

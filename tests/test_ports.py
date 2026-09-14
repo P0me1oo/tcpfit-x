@@ -143,7 +143,7 @@ class PortReservationTests(unittest.TestCase):
                         finally:
                             connection.close()
                         self.assertIn(":{}/j/{}.sh".format(args.control_port, coordinator.token),
-                                      MODULE.join_command(args, coordinator.token))
+                                      MODULE.join_command(args, coordinator.token, "linux"))
                         if interrupted:
                             raise KeyboardInterrupt()
                     except KeyboardInterrupt:

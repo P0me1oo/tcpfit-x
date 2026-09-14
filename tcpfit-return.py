@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.18.1"
+VERSION = "0.18.2"
 MIB = 1048576
 BUFFER_MAX_BYTES = 2147483647
 BUFFER_MIN_STEP = MIB
@@ -2031,23 +2031,24 @@ def powershell_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def join_command(args, token, platform="auto"):
-    if platform == "auto":
-        # PowerShell 用块注释跳过 Shell 分支；Shell 用行注释跳过后面的 PowerShell 分支。
-        # 下载和执行放在子 Shell 中，保留客户端退出码，且不会退出用户的终端。
-        return ("echo `# <#` >/dev/null;" + join_command(args, token, "linux") +
-                ";#> | Out-Null;" + join_command(args, token, "windows"))
+def join_command(args, token, platform):
     host = "[{}]".format(args.server) if args.family == 6 else args.server
     base = "http://{}:{}/j/{}".format(host, args.control_port, token)
+    # 完整下载成功后才执行；回退下载会丢弃 curl 的残缺输出。
+    shell = ("s=$(curl -fsS --noproxy '*' \"$u\")||"
+             "s=$(wget -qO- \"$u\")||exit;printf %s \"$s\"|sh")
     if platform == "windows":
         # 接入脚本带 UTF-8 BOM，兼容 PowerShell 5.1/7 的 WebClient 解码。
-        return ("&{$w=[Net.WebClient]::new();$w.Proxy=$null;try{iex($w.DownloadString(" +
-                powershell_quote(base + ".ps1") + "))}finally{$w.Dispose()}}")
+        return ("try{iex(([Net.WebClient]@{Proxy=$null}).DownloadString(" +
+                powershell_quote(base + ".ps1") + "))}catch{throw}")
     if platform != "linux":
         raise ValueError("未知测速端平台: " + platform)
-    # URL 只写一次；完整下载成功后才执行，回退下载会丢弃 curl 的残缺输出。
-    return ("(u=" + shlex.quote(base + ".sh") + ";s=$(curl -fsS --noproxy '*' \"$u\")||"
-            "s=$(wget -qO- \"$u\")||exit;printf %s \"$s\"|sh)")
+    return "(u=" + shlex.quote(base + ".sh") + ";" + shell + ")"
+
+
+def print_join_commands(args, token):
+    print("\nLinux / OpenWrt / iStoreOS：\n{}\n\nWindows PowerShell 5.1/7：\n{}\n".format(
+        join_command(args, token, "linux"), join_command(args, token, "windows")), flush=True)
 
 
 def reference_bandwidth(server_bw, client_bw):
@@ -2182,8 +2183,7 @@ def run_prepared_task(args, reservations):
                               "source_ip_restricted": firewall.state["backend"] != "none"}
         start_http(coordinator)
         log("接入 / 测速端口: {} / {} TCP".format(args.control_port, args.iperf_port))
-        print("\n在测速端完整复制以下命令执行（Linux / OpenWrt / iStoreOS 或 Windows PowerShell）：\n\n{}\n".format(
-            join_command(args, coordinator.token)), flush=True)
+        print_join_commands(args, coordinator.token)
         log("token {} 秒内有效，只能配对一次。测速自动执行，结束后在调优端选择保存配置。".format(args.token_ttl))
         while not coordinator.paired.wait(0.5):
             coordinator.check()

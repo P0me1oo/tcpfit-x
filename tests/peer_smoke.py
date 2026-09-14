@@ -39,8 +39,7 @@ def main():
         try:
             firewall.setup()
             MODULE.start_http(coordinator)
-            print("在测速端完整复制以下命令执行（Linux / OpenWrt / iStoreOS 或 Windows PowerShell）：", flush=True)
-            print(MODULE.join_command(args, coordinator.token), flush=True)
+            MODULE.print_join_commands(args, coordinator.token)
             while not coordinator.paired.wait(0.5):
                 coordinator.check()
             idle = coordinator.measure_idle_latency(2)

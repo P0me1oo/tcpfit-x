@@ -109,7 +109,7 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.addCleanup(self.coordinator.close)
 
     def launch(self, code=None):
-        code = code or MODULE.join_command(self.args, self.coordinator.token)
+        code = code or MODULE.join_command(self.args, self.coordinator.token, "windows")
         code = "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n$ErrorActionPreference = 'Stop'\n" + code
         encoded = base64.b64encode(code.encode("utf-16-le")).decode("ascii")
         process = subprocess.Popen([self.shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
@@ -193,9 +193,27 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.coordinator.firewall.pair.assert_called_once_with("127.0.0.1")
 
-    def test_auto_join_from_standard_input_pairs_and_finishes(self):
+    def test_windows_join_downloads_once_and_bypasses_default_proxy(self):
+        code = "[Net.WebRequest]::DefaultWebProxy = [Net.WebProxy]::new('http://127.0.0.1:1');"
+        code += MODULE.join_command(self.args, self.coordinator.token, "windows")
+        with mock.patch.object(self.coordinator, "join_script", wraps=self.coordinator.join_script) as download:
+            token = self.coordinator.token
+            status, output = self.run_client(code)
+            self.assertEqual(status, 0, output)
+            self.assertIn("Windows 接入完成", output)
+            download.assert_called_once_with(token, "ps1")
+        self.coordinator.firewall.pair.assert_called_once_with("127.0.0.1")
+
+    def test_windows_join_rejects_expired_download_with_default_error_handling(self):
+        self.coordinator.expires = time.monotonic() - 1
+        code = "$ErrorActionPreference = 'Continue';" + MODULE.join_command(self.args, self.coordinator.token, "windows")
+        status, output = self.run_client(code)
+        self.assertNotEqual(status, 0, output)
+        self.coordinator.firewall.pair.assert_not_called()
+
+    def test_windows_join_from_standard_input_pairs_and_finishes(self):
         code = "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n"
-        code += "$ErrorActionPreference = 'Stop'\n" + MODULE.join_command(self.args, self.coordinator.token) + "\n"
+        code += "$ErrorActionPreference = 'Stop'\n" + MODULE.join_command(self.args, self.coordinator.token, "windows") + "\n"
         process = subprocess.Popen([self.shell, "-NoProfile", "-NonInteractive", "-Command", "-"],
                                    env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
@@ -248,7 +266,7 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.env["TCPFIT_TEST_MODE"] = "hang"
         self.coordinator.next_job.return_value = "RUN {} 2 1".format(secrets.token_hex(8))
         token = self.coordinator.token
-        join = MODULE.join_command(self.args, token)
+        join = MODULE.join_command(self.args, token, "windows")
         process = self.launch(join)
         marker = self.root / "child.pid"
         deadline = time.monotonic() + 10

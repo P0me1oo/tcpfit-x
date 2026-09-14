@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.18.2
+
+- 接入指令按系统分别显示：Linux / OpenWrt / iStoreOS 使用 Shell 单行命令，Windows PowerShell 5.1/7 使用 PowerShell 单行命令。按系统复制其中一条即可，两条均不包含 `sudo`，每条只保留一份下载地址和临时 token。
+- 保留同版本脚本、curl/wget 下载回退和完整下载后执行；修正 Windows 专用命令在下载失败时返回成功退出码的问题。双端协议检查同步使用两类指令，补充两类指令显示、IPv6 Shell 接入、Windows 单次下载与代理绕过、过期下载拒绝回归，同步说明、运行模块版本和发布校验清单。
+
 ## 0.18.1
 
 - 通用接入入口改为单行命令，Linux / OpenWrt / iStoreOS Shell 和 Windows PowerShell 5.1/7 均可粘贴后按一次回车执行，无需安装启动器。

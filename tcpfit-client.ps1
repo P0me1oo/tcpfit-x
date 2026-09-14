@@ -9,7 +9,7 @@ param(
     [switch]$Help
 )
 
-$TCPFIT_CLIENT_VERSION = '0.18.1'
+$TCPFIT_CLIENT_VERSION = '0.18.2'
 
 function Initialize-TcpfitProcessJob {
     # 由系统在 PowerShell 被强制关闭时终止本任务的子进程，无需凭据文件或守护脚本。

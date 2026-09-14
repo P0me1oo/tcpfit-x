@@ -162,7 +162,7 @@ class NetworkIntegrationTests(unittest.TestCase):
                         tools.mkdir()
                         (tools / "sh").symlink_to(shutil.which("sh"))
                         (tools / downloader).symlink_to(shutil.which(downloader))
-                        result = subprocess.run(["/bin/sh", "-c", MODULE.join_command(args, coordinator.token)],
+                        result = subprocess.run(["/bin/sh", "-c", MODULE.join_command(args, coordinator.token, "linux")],
                                                 env=dict(os.environ, PATH=str(tools), http_proxy="", HTTP_PROXY=""),
                                                 capture_output=True, text=True, timeout=10)
                         self.assertEqual(result.returncode, 0, result.stderr)
