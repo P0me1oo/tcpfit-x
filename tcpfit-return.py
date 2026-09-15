@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.21.1"
+VERSION = "0.22.0"
 REPO = "P0me1oo/tcpfit-x"
 # 测速端脚本从 GitHub 按版本标签下载，保证两端脚本同版本。
 CLIENT_SCRIPT_RAW = "https://raw.githubusercontent.com/{repo}/refs/tags/v{version}/{name}"
@@ -2044,7 +2044,7 @@ def select_configuration(book, recommendation, automatic=False, reader=None, che
             raise TaskError("无法读取保存选择，请在终端运行或使用 --yes 自动保存推荐配置") from error
 
         def reader():
-            print("选择配置序号 [推荐 {}，回车确认]：".format(recommended_number), end="", flush=True)
+            print("选择配置序号 [0 不修改，推荐 {}，回车确认]：".format(recommended_number), end="", flush=True)
             while True:
                 if check:
                     check()
@@ -2063,6 +2063,8 @@ def select_configuration(book, recommendation, automatic=False, reader=None, che
             normalized = value.lstrip("0") or "0"
             if re.fullmatch(r"[0-9]+", value) and len(normalized) <= len(str(len(groups))):
                 number = int(normalized)
+                if number == 0:
+                    return None, 0
                 group = next((item for item in groups if item["number"] == number), None)
                 if group and buffer_floor_met(group["buffers"], minimum) and (
                         recommendation in group["config_ids"] or any(row["status"] == "valid" for row in group["measurements"])):
@@ -2229,7 +2231,10 @@ def validate_environment(args):
 
 
 def print_report(result):
-    print("\n已保存配置 {}（推荐 {}）".format(result["selected_number"], result["recommended_number"]), flush=True)
+    if result["selected_number"] == 0:
+        print("\n已选择 0：不修改，已恢复调优前配置", flush=True)
+    else:
+        print("\n已保存配置 {}（推荐 {}）".format(result["selected_number"], result["recommended_number"]), flush=True)
     print("  最终缓冲区：" + describe_buffers(result["buffers_final"]))
     print("  判定：" + result["selected_validation"])
     print("  当前限速：" + result["rate_limits_final"])
@@ -2275,17 +2280,38 @@ def save_configuration_choice(book, worker, result, recommendation, automatic, c
     result["recommended_config"] = recommendation
     book.save()
     groups = measurement_table(book, recommendation, minimum)
+    print("0：不修改，恢复调优前配置", flush=True)
     result["configuration_options"] = [{"number": group["number"], "config_id": group["config_id"],
                                         "config_ids": group["config_ids"],
                                         "selectable": buffer_floor_met(group["buffers"], minimum) and (
                                             recommendation in group["config_ids"] or any(row["status"] == "valid" for row in group["measurements"])),
                                         "measurement_numbers": [row["number"] for row in group["measurements"]]}
                                        for group in groups]
+    result["configuration_options"].append({"number": 0, "config_id": result["original_config"],
+        "config_ids": [result["original_config"]], "selectable": True, "measurement_numbers": []})
     recommended_group = next(group for group in groups if recommendation in group["config_ids"])
     result["recommended_number"] = recommended_group["number"]
     result["recommended_measurements"] = [row for row in recommended_group["measurements"] if row["status"] == "valid"]
     selected, number = select_configuration(book, recommendation, automatic, check=check, minimum=minimum)
     check()
+    if number == 0:
+        selected = result["original_config"]
+        selected_state = book.configurations[selected]
+        # 原配置可低于试调下限；完整恢复原文件，不重新生成持久化配置。
+        Snapshot.restore(selected_state)
+        final_state = book.capture()
+        if configuration_identity(final_state) != configuration_identity(selected_state):
+            raise TaskError("恢复后的配置与调优前快照不一致")
+        result.update(selected_config=selected, selected_number=0, selection="manual",
+                      selected_validation="不修改，已恢复调优前配置", base_kept=False,
+                      base_reasons=["用户选择不修改"], final=[],
+                      buffers_final=buffers_from_sysctl(final_state["sysctl"]),
+                      final_rate=final_state["queue"]["rate"],
+                      rate_limits_final=describe_rate_limits(final_state["queue"]),
+                      shape_reason="用户选择不修改，已恢复原整形")
+        log("已选择 0：不修改，已恢复调优前配置")
+        check()
+        return final_state
     selected_state = book.configurations[selected]
     final_state = book.capture()
     changed = configuration_identity(final_state) != configuration_identity(selected_state)
@@ -2578,7 +2604,8 @@ def run_prepared_task(args, reservations):
         final_state = save_configuration_choice(book, worker, result, recommendation, args.yes, check_selection)
 
         atomic_json(record_dir / "final.json", final_state)
-        worker.run("archive", "return-final-" + task_id[:8], args.role, reference, rtt, coordinator.peer, task_id, record_dir / "final.json")
+        if result["selected_number"] != 0:
+            worker.run("archive", "return-final-" + task_id[:8], args.role, reference, rtt, coordinator.peer, task_id, record_dir / "final.json")
         check_selection()
         result["status"] = "completed"
         success = True
@@ -2609,7 +2636,8 @@ def run_prepared_task(args, reservations):
                 log("{}；列出已测结果，推荐有效接收速度中位数最快的配置".format(reason))
                 final_state = save_configuration_choice(book, worker, result, recommendation, args.yes, check_selection)
                 atomic_json(record_dir / "final.json", final_state)
-                worker.run("archive", "return-final-" + task_id[:8], args.role, reference, result["rtt_ms"], coordinator.peer, task_id, record_dir / "final.json")
+                if result["selected_number"] != 0:
+                    worker.run("archive", "return-final-" + task_id[:8], args.role, reference, result["rtt_ms"], coordinator.peer, task_id, record_dir / "final.json")
                 check_selection()
                 result["status"] = "completed"
                 success = True

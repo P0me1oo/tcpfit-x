@@ -113,7 +113,7 @@ class RecordTests(unittest.TestCase):
             self.current = snapshot(14, cc="cubic")
             self.book.measure_group("回退候选", modes=(4,))
         self.book.records[-1].update(decision="已回退", stability="unstable")
-        answers = iter(["bad", "-1", "1.5", "999", "0", "9" * 5000, "0002"])
+        answers = iter(["bad", "-1", "1.5", "999", "9" * 5000, "0002"])
         with redirect_stdout(io.StringIO()):
             selected, number = MODULE.select_configuration(self.book, "C1", reader=lambda: next(answers))
         self.assertEqual((selected, number), ("C2", 2))
@@ -134,6 +134,34 @@ class RecordTests(unittest.TestCase):
             self.book.measure_group("初值测速")
             self.assertEqual(MODULE.select_configuration(self.book, "C1", automatic=True, reader=reader), ("C1", None))
         reader.assert_not_called()
+
+    def test_zero_selects_no_change_without_measured_original_configuration(self):
+        self.book.register()
+        for answer in ("0", "000", " 0 "):
+            self.assertEqual(MODULE.select_configuration(self.book, "C1", reader=lambda: answer),
+                             (None, 0))
+
+    def test_zero_restores_original_files_and_buffers_below_trial_floor(self):
+        original = self.book.register()
+        before = copy.deepcopy(self.current)
+        self.current = snapshot(24)
+        with redirect_stdout(io.StringIO()):
+            recommendation = self.book.measure_group("候选")[0]["config_id"]
+        result = {"original_config": original, "buffer_plan": {"min_bytes": 20 * MODULE.MIB}}
+
+        def restore(saved):
+            self.current = copy.deepcopy(saved)
+
+        with mock.patch.object(MODULE, "select_configuration", return_value=(None, 0)), \
+                mock.patch.object(MODULE.Snapshot, "restore", side_effect=restore) as restore_call, \
+                mock.patch.object(MODULE, "persist_selected_configuration") as persist, \
+                redirect_stdout(io.StringIO()):
+            final = MODULE.save_configuration_choice(self.book, self.worker, result,
+                                                       recommendation, False, lambda: None)
+        self.assertEqual(final, before)
+        restore_call.assert_called_once_with(before)
+        persist.assert_not_called()
+        self.assertEqual(result["selected_number"], 0)
 
     def test_same_parameters_merge_repeats_and_modes_with_separate_snapshots(self):
         with redirect_stdout(io.StringIO()):

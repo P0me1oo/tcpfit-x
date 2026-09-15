@@ -1,4 +1,4 @@
-# tcpfit-x 0.21.1
+# tcpfit-x 0.22.0
 
 按每台机器实测推导的 TCP 调优工具. 不套用固定参数, 实测 BDP 与限速器拐点.
 
@@ -198,7 +198,7 @@ tcpfit return --server-bw 5000 --client-bw 1000
 
 启动时自动探测服务器地址：优先使用实际出站路由的公网源地址，本机只有内网地址或无法取得源地址时，再查询公网出口。探测成功直接使用，不要求填写；只有探测失败才提示输入家宽可访问的 IP 或域名。也可通过 `--server` 指定地址。
 
-启动前可填写两端标称带宽，再填写用途和测速次数，不询问端口；两端带宽都留空时自动用四连接探测。默认固定使用接入端口 **TCP 12223**、测速端口 **TCP 12224**，确认后显示实际端口，并分别列出 Linux / OpenWrt / iStoreOS 和 Windows CMD / PowerShell 5.1/7 的单行接入命令。按测速端系统复制对应的一条：Linux / 路由器在 Shell 中执行，Windows 在 CMD 或 PowerShell 中执行，粘贴后按一次回车即可。结束后在调优端查看按配置合并的结果，输入配置序号选择，回车保存推荐配置。Linux 端缺少依赖时需要 root 权限安装。
+启动前可填写两端标称带宽，再填写用途和测速次数，不询问端口；两端带宽都留空时自动用四连接探测。默认固定使用接入端口 **TCP 12223**、测速端口 **TCP 12224**，确认后显示实际端口，并分别列出 Linux / OpenWrt / iStoreOS 和 Windows CMD / PowerShell 5.1/7 的单行接入命令。按测速端系统复制对应的一条：Linux / 路由器在 Shell 中执行，Windows 在 CMD 或 PowerShell 中执行，粘贴后按一次回车即可。结束后在调优端查看按配置合并的结果，输入配置序号选择，回车保存推荐配置；输入 `0` 不修改，恢复调优前配置。Linux 端缺少依赖时需要 root 权限安装。
 
 启动时实际绑定两个端口并保留到对应服务启动；端口已被占用时明确报错退出，不自动换端口。接入服务直接接管预留套接字；iperf3 启动前释放测速端口的预留，无法启动时明确失败并清理。实际端口写入本次任务结果。已有 `--control-port`、`--iperf-port` 参数继续兼容：省略时使用上述固定端口，仅显式传 `0` 时自动选择；显式端口必须为 `1024–65535`、互不相同且未被占用。
 
@@ -316,7 +316,7 @@ iperf3 始终由家宽执行客户端 `-R`，服务器发送数据。缓冲区�
 | 2 | 14/14 | 99.00 / 0.300 | 重传优秀 |
 | 3 | 15/15 | 99.00 / 0.800 | 推荐 |
 
-提示为 `选择配置序号 [推荐 3，回车确认]：`，输入表中的序号即可。同组要求实际 TCP 参数、队列和路由一致，仅存档时间或持久化文件变化不拆组；缓冲区相同但拥塞控制或限速不同的配置仍分开。
+提示为 `选择配置序号 [0 不修改，推荐 3，回车确认]：`，输入表中的序号即可。输入 `0` 撤销本次试调，完整恢复调优前的参数、队列、路由和配置文件，不生成新的调优存档；测速记录仍保留。正常结束和提前停止后的结果选择都支持 `0`，原配置无需满足试调缓冲区下限或具有有效测速。同组要求实际 TCP 参数、队列和路由一致，仅存档时间或持久化文件变化不拆组；缓冲区相同但拥塞控制或限速不同的配置仍分开。
 
 失败、跳过、不稳定和未完成的状态用简短判定显示，缺失指标显示“未取得”。至少有一次有效测速的配置可手动选择，历史判定会保留；没有有效测速的失败配置不能选择。手选时恢复该组对应的完整快照并同步持久化文件。逐次结果仍在记录目录中，结果合并不会删除原始数据。
 
@@ -328,7 +328,7 @@ iperf3 始终由家宽执行客户端 `-R`，服务器发送数据。缓冲区�
 - `measurement-index.json`：所有测量序号、阶段、连接数、原始指标、状态和配置编号。即使后续失败，先前有效结果及已计划但跳过的测量也保留。
 - `configurations/<快照编号>.json`：测速对应的完整参数、队列、路由、服务和配置文件快照；内部快照编号不在交互表中显示。
 - `buffer-trials.json`：每轮调整原因、前后参数、实测结果、暂留或回退、失败恢复和停止原因；首次稳定候选建立参照时记录 `established_reference`；高重传后微调时记录 `refine_from_max_bytes`，说明从哪一个候选向下微调。
-- `result.json`：带宽参考及来源、初值测速、单连接试调、已有整形验证、推荐和实际选择配置，以及清理结果。初值稳定时 `speed_reference` 指向 `initial_after`；初值不稳定时指向首次稳定候选 `first_stable_after`，始终未取得稳定参照则为 `null`。`buffer_search.speed_reference_round` 记录建立参照的轮次，初值为 `0`，未取得为 `null`；`buffer_search.uncertain_max_bytes` 和 `rechecked_max_bytes` 分别记录不稳定候选与补测候选；每轮 `assessment` 区分 `unstable`、`rejected` 和 `qualified`。`after` 使用已保留试调组的数据；触发最终确认时，`final_confirmation_reasons` 记录原因。`configuration_options` 将显示序号关联到完整快照和逐次测量；`recommended_number`、`selected_number` 分别记录推荐与保存序号，`selected_config` 指向实际保存快照。自动探测时另记录 `path_bandwidth`，`base_kept` 只表示自动推荐对调优参数的判断。
+- `result.json`：带宽参考及来源、初值测速、单连接试调、已有整形验证、推荐和实际选择配置，以及清理结果。初值稳定时 `speed_reference` 指向 `initial_after`；初值不稳定时指向首次稳定候选 `first_stable_after`，始终未取得稳定参照则为 `null`。`buffer_search.speed_reference_round` 记录建立参照的轮次，初值为 `0`，未取得为 `null`；`buffer_search.uncertain_max_bytes` 和 `rechecked_max_bytes` 分别记录不稳定候选与补测候选；每轮 `assessment` 区分 `unstable`、`rejected` 和 `qualified`。`after` 使用已保留试调组的数据；触发最终确认时，`final_confirmation_reasons` 记录原因。`configuration_options` 将显示序号关联到完整快照和逐次测量；`recommended_number`、`selected_number` 分别记录推荐与保存序号，`selected_config` 指向实际保存快照；选择不修改时，`selected_number` 为 `0`，`selected_config` 指向调优前快照。自动探测时另记录 `path_bandwidth`，`base_kept` 只表示自动推荐对调优参数的判断。
 
 原始 iperf3 的临时 cookie 不写入长期记录。失败、不完整数据不参与自动比较；任何阶段都不会改用公共测速节点的数据。
 原版 `pre-tune.snapshot`、`0000` 快照和 `rollback` 语义保留。新增任务前后存档出现在 `tcpfit archive list` 中；通过 `tcpfit archive restore <序号>` 恢复优化线路调优存档时，会恢复完整队列、文件权限和服务状态。保留这些存档时也要保留对应的 `return/` 记录目录。

@@ -817,7 +817,9 @@ class ReturnBufferFlowTests(unittest.TestCase):
                 self.assertEqual(MODULE.buffers_from_sysctl(final["sysctl"]), buffer_state(8))
             else:
                 self.assertEqual(result["buffers_final"], worker.state)
-                if selection is not None and result["selected_config"] != result["recommended_config"]:
+                if selection == 0:
+                    persist_call.assert_not_called()
+                elif selection is not None and result["selected_config"] != result["recommended_config"]:
                     saved = json.loads(record.with_name("final.json").read_text(encoding="utf-8"))
                     self.assertEqual(saved["sysctl"]["net.ipv4.tcp_congestion_control"],
                                      "cubic" if selection == 1 and server_bw is None and client_bw is None else "bbr")
@@ -1002,6 +1004,17 @@ class ReturnBufferFlowTests(unittest.TestCase):
                                                probe_speeds=speeds, expected_error=reason)
                 self.assertNotIn("buffer_trials", result)
                 self.assertEqual(result["buffers_final"], buffer_state(8))
+
+    def test_zero_restores_original_after_completion_or_interruption(self):
+        for failure in (None, KeyboardInterrupt()):
+            with self.subTest(failure=failure):
+                result, output = self.exercise_flow(True, failure, selection=0)
+                self.assertEqual(result["selected_number"], 0)
+                self.assertEqual(result["selected_config"], result["original_config"])
+                self.assertEqual(result["buffers_final"], buffer_state(8))
+                self.assertFalse(result["base_kept"])
+                self.assertEqual(result["final"], [])
+                self.assertIn("不修改，已恢复调优前配置", output)
 
     def test_manual_sequence_restores_full_configuration_instead_of_recommended_buffers(self):
         result, output = self.exercise_flow(True, selection=1, server_bw=None, client_bw=None)

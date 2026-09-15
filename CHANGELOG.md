@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.22.0
+
+- 优化线路调优结果新增 `0：不修改`，正常完成和提前停止均可选择，完整恢复调优前配置，不生成新的调优存档，保留测速记录。
+- 选择 0 不受试调缓冲区下限和有效测速要求限制；回车和 `--yes` 仍保存推荐配置。同步结果记录、使用说明、回归测试和发布校验清单。
+
 ## 0.21.1
 
 - Windows 接入命令改为 `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "..."` 启动，通过 `iwr -UseBasicParsing -OutFile` 下载脚本，再执行文件并传入 `-e`、`-p`、`-t`，支持直接粘贴到 CMD 或 PowerShell 5.1/7。
