@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.21.0"
+VERSION = "0.21.1"
 REPO = "P0me1oo/tcpfit-x"
 # 测速端脚本从 GitHub 按版本标签下载，保证两端脚本同版本。
 CLIENT_SCRIPT_RAW = "https://raw.githubusercontent.com/{repo}/refs/tags/v{version}/{name}"
@@ -2164,14 +2164,18 @@ def join_endpoint(args):
 def join_command(args, token, platform):
     endpoint = join_endpoint(args)
     if platform == "windows":
-        # 下载来的脚本带 UTF-8 BOM，交给脚本块执行才能传入接入参数。
-        # PowerShell 5.1 的默认安全协议可能不含 TLS 1.2，先补上再下载 HTTPS 地址。
-        return ("try{[Net.ServicePointManager]::SecurityProtocol="
+        # 不在双引号内使用变量，避免外层 PowerShell 提前展开；CMD 可执行同一条命令。
+        # 每次生成独立临时文件，避免覆盖已有文件或与另一次接入冲突。
+        script = "tcpfit-" + secrets.token_hex(8) + ".ps1"
+        return ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "'
+                "Push-Location ([IO.Path]::GetTempPath()) -ErrorAction Stop; "
+                "try{[Net.ServicePointManager]::SecurityProtocol="
                 "[Net.ServicePointManager]::SecurityProtocol -bor 3072;"
-                "& ([scriptblock]::Create((New-Object Net.WebClient).DownloadString(" +
-                powershell_quote(client_script_url("tcpfit-client.ps1")) + "))) -e " +
+                "iwr " + powershell_quote(client_script_url("tcpfit-client.ps1")) +
+                " -UseBasicParsing -OutFile '" + script + "' -ErrorAction Stop; & '.\\" + script + "' -e " +
                 powershell_quote(endpoint) + " -p " + str(args.iperf_port) +
-                " -t " + powershell_quote(token) + "}catch{throw}")
+                " -t " + powershell_quote(token) + "}catch{throw}finally{Remove-Item -LiteralPath '" +
+                script + "' -ErrorAction SilentlyContinue; Pop-Location}\"")
     if platform != "linux":
         raise ValueError("未知测速端平台: " + platform)
     return "wget -qO- {} | sh -s -- -e {} -p {} -t {}".format(
@@ -2180,7 +2184,7 @@ def join_command(args, token, platform):
 
 
 def print_join_commands(args, token):
-    print("\nLinux / OpenWrt / iStoreOS：\n{}\n\nWindows PowerShell 5.1/7：\n{}\n\n"
+    print("\nLinux / OpenWrt / iStoreOS：\n{}\n\nWindows CMD / PowerShell 5.1/7：\n{}\n\n"
           "能直连 GitHub 时可删除命令里的 {} 镜像前缀。\n".format(
               join_command(args, token, "linux"), join_command(args, token, "windows"),
               CLIENT_SCRIPT_MIRROR), flush=True)

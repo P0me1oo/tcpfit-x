@@ -190,6 +190,9 @@ class HttpTransportTests(unittest.TestCase):
                                      MODULE.REPO, MODULE.VERSION, name))
 
     def test_each_platform_displays_its_own_single_line_join_command(self):
+        filename = mock.patch.object(MODULE.secrets, 'token_hex', return_value='0123456789abcdef')
+        filename.start()
+        self.addCleanup(filename.stop)
         for family, server, endpoint in ((4, "192.0.2.1", "192.0.2.1:5211"),
                                          (6, "2001:db8::1", "[2001:db8::1]:5211")):
             with self.subTest(family=family):
@@ -198,7 +201,7 @@ class HttpTransportTests(unittest.TestCase):
                     MODULE.print_join_commands(args, self.coordinator.token)
                 lines = output.getvalue().splitlines()
                 self.assertIn("Linux / OpenWrt / iStoreOS：", lines)
-                self.assertIn("Windows PowerShell 5.1/7：", lines)
+                self.assertIn("Windows CMD / PowerShell 5.1/7：", lines)
                 self.assertIn("能直连 GitHub 时可删除命令里的 {} 镜像前缀。".format(MODULE.CLIENT_SCRIPT_MIRROR), lines)
                 for platform, name in (("linux", "tcpfit-client.sh"), ("windows", "tcpfit-client.ps1")):
                     join = MODULE.join_command(args, self.coordinator.token, platform)

@@ -1,5 +1,9 @@
 # 开发与验证
 
+### 0.21.1 本地验证（2026-09-16）
+
+Windows 本机完整回归共 236 项：217 项通过，19 项 Linux 隔离集成和需要 wget 的用例按平台与工具条件跳过，无失败。验证同一条 Windows 接入命令可从 CMD、PowerShell 5.1/7 启动，并覆盖单次下载、IPv4/IPv6 配对、中文输出、下载失败不执行已有脚本，以及成功和 token 过期后的临时文件清理。下载测试使用本地 HTTP，不访问 GitHub；未执行实际线路测速。Python、Shell、PowerShell 语法检查、五个发布文件的 SHA-256 校验及 `git diff --check` 均通过。
+
 ### 0.21.0 本地验证（2026-09-16）
 
 Windows 本机完整回归共 232 项：213 项通过，19 项 Linux 隔离集成和需要 wget 的用例按平台与工具条件跳过，无失败。新增验证下载地址按版本标签生成、镜像前缀可整段删除后仍是原始地址、`-e`/`-p`/`-t` 三个参数在 sh、Bash、dash 下的传递与退出码保留、下载失败时不运行测速端，以及 PowerShell 5.1/7 的脚本块执行、单次下载和 token 过期后接入失败。真实下载链路用已发布的 v0.18.3 地址单独验证：镜像地址与删除前缀后的原始地址都能取到脚本并正确接收管道参数。Python、Shell 语法检查、五个发布文件的 SHA-256 校验及 `git diff --check` 均通过；实际线路、家宽接入和 Linux 隔离网络测试未执行。
@@ -22,7 +26,7 @@ sh -n tcpfit-client.sh
 
 常规回归检查真实结果解析、错误与不完整数据拒绝、HTTP 接入、一次性配对、来源绑定、心跳中断、防火墙选择、优化线路调优单连接重传阈值、已有整形的四连接验证条件和路由恢复。入口回归覆盖服务器地址自动探测、IPv4/IPv6、外部查询失败、手动回退及数字菜单与实际操作的对应关系；使用替代命令，不请求外网或修改网络。依赖测试使用替代包管理器检查实际安装请求，不执行软件安装。Linux 集成测试默认跳过，不会在普通开发机上修改网络。
 
-Windows 会分别用已安装的 PowerShell 5.1 和 7 运行 `tests/test_windows_client.py`，需要系统的 .NET Framework C# 编译器生成临时替代程序。测试执行 Windows 单行接入命令，使用仅包含临时测速工具的 PATH，验证无需 Shell、curl 或 Python；使用真实本地 HTTP、套接字和子进程，检查脚本下载与中文编码、IPv4/IPv6 配对、单连接和四连接下载参数、纯空载延迟采集、延迟回报、无效指令与测速失败、WinGet 安装后查找，以及强制关闭后的进程和任务锁清理。回归测试把 GitHub 下载地址指向调优端自带的 `/join.ps1`，不访问外网。接入命令须只下载一次 PowerShell 脚本，并在默认错误处理方式下于 token 过期时接入失败；通过标准输入传入时，一次回车即可配对。纯延迟任务必须回报有效样本且不启动测速子进程。替代程序只生成测试结果，不进行大流量测速或实际安装；缺少对应 PowerShell 或编译器时跳过。可以单独执行：
+Windows 会分别用已安装的 PowerShell 5.1 和 7 运行 `tests/test_windows_client.py`，需要系统的 .NET Framework C# 编译器生成临时替代程序。测试执行 Windows 单行接入命令，使用仅包含临时测速工具和系统 PowerShell 的 PATH，验证无需 Shell、curl 或 Python；使用真实本地 HTTP、套接字和子进程，检查脚本下载与中文编码、IPv4/IPv6 配对、单连接和四连接下载参数、纯空载延迟采集、延迟回报、无效指令与测速失败、WinGet 安装后查找，以及强制关闭后的进程和任务锁清理。回归测试把 GitHub 下载地址指向调优端自带的 `/join.ps1`，不访问外网。接入命令须只下载一次 PowerShell 脚本，并在默认错误处理方式下于 token 过期时接入失败；通过标准输入传入时，一次回车即可配对。另用 CMD 直接执行同一条命令，验证配对和临时文件清理；下载失败时，即使目标位置已有脚本也不得执行，正常完成和接入失败后均须删除临时脚本。强制终止测试直接运行内部命令，只结束执行测速脚本的 PowerShell 进程，检查 iperf3 子进程是否自动退出。纯延迟任务必须回报有效样本且不启动测速子进程。替代程序只生成测试结果，不进行大流量测速或实际安装；缺少对应 PowerShell 或编译器时跳过。可以单独执行：
 
 ```powershell
 python -X utf8 -m unittest discover -s tests -p test_windows_client.py -v
@@ -172,7 +176,7 @@ sudo env TCPFIT_INSTALL_INTEGRATION=1 TCPFIT_LINUX_INTEGRATION=1 \
 sudo python3 tests/peer_smoke.py --server <服务器可达地址>
 ```
 
-在另一端按系统复制对应的一条接入命令、一次粘贴；Linux / OpenWrt / iStoreOS 在 Shell 中执行，Windows 在 PowerShell 中执行。该检查分别运行短时单连接和四连接下载，结束后清理自己的端口规则；不应用系统调优参数。要验证完整流程，使用 `bash tcpfit.sh return`。
+在另一端按系统复制对应的一条接入命令、一次粘贴；Linux / OpenWrt / iStoreOS 在 Shell 中执行，Windows 在 CMD 或 PowerShell 中执行。该检查分别运行短时单连接和四连接下载，结束后清理自己的端口规则；不应用系统调优参数。要验证完整流程，使用 `bash tcpfit.sh return`。
 
 完整实测必须另外保存服务器现状，并在测试结束后按约定保留或恢复。核对运行参数、持久化文件、队列、默认路由、服务状态以及两端的临时进程和文件。路由比较应排除自动路由剩余寿命等动态字段。测速端缺少 tc 时，可通过 `ip -d link show` 核对队列类型，不要为了检查而改它的队列。
 
@@ -225,4 +229,4 @@ sha256sum tcpfit.sh install.sh tcpfit-return.py tcpfit-client.sh tcpfit-client.p
 sha256sum -c SHA256SUMS
 ```
 
-发布 `v<版本号>` 标签时，Release 附件应包含上述五个运行及安装文件和 `SHA256SUMS`。更新命令从 Release 下载；缺文件或校验失败会停止安装或更新。测速端从当前调优服务器获取脚本，不依赖 Release 下载。
+发布 `v<版本号>` 标签时，Release 附件应包含上述五个运行及安装文件和 `SHA256SUMS`。更新命令从 Release 下载；缺文件或校验失败会停止安装或更新。测速端默认从 GitHub 对应版本标签下载脚本，因此发布时也必须推送标签；调优服务器保留脚本下载入口作为备用。

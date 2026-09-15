@@ -1,5 +1,10 @@
 # 更新记录
 
+## 0.21.1
+
+- Windows 接入命令改为 `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "..."` 启动，通过 `iwr -UseBasicParsing -OutFile` 下载脚本，再执行文件并传入 `-e`、`-p`、`-t`，支持直接粘贴到 CMD 或 PowerShell 5.1/7。
+- 脚本保存到系统临时目录中的随机文件；下载失败立即停止，正常结束或报错后清理文件。保留 TLS 1.2 兼容处理，更新终端提示与回归测试。
+
 ## 0.21.0
 
 - 优化线路调优的测速端接入命令改为从 GitHub 下载测速脚本，地址按调优端版本指向 `refs/tags/v<版本>`；因此发布新版本时必须推送对应的 `v<版本>` 标签，否则该版本的接入命令取不到脚本。

@@ -5,6 +5,7 @@ from ctypes import wintypes
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -93,7 +94,10 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.bin.mkdir()
         self.binary = self.bin / "iperf3.exe"
         shutil.copyfile(self.fake_tool, self.binary)
-        self.env = dict(os.environ, PATH=str(self.bin), LOCALAPPDATA=str(self.root), ProgramFiles=str(self.root),
+        powershell_dir = str(Path(shutil.which('powershell.exe')).parent)
+        self.env = dict(os.environ, PATH=os.pathsep.join((str(self.bin), powershell_dir)),
+                        TEMP=str(self.root), TMP=str(self.root),
+                        LOCALAPPDATA=str(self.root), ProgramFiles=str(self.root),
                         TCPFIT_TEST_PID_FILE=str(self.root / "child.pid"), TCPFIT_TEST_MODE="normal")
         self.start_server()
 
@@ -129,7 +133,8 @@ class WindowsPowerShell51Tests(unittest.TestCase):
     @staticmethod
     def stop_client(process):
         if process.poll() is None:
-            process.kill()
+            subprocess.run([str(Path(os.environ['SystemRoot']) / 'System32/taskkill.exe'),
+                            '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=10)
         process.communicate(timeout=10)
 
     def run_client(self, code=None):
@@ -209,6 +214,30 @@ class WindowsPowerShell51Tests(unittest.TestCase):
             self.assertIn("Windows 接入完成", output)
             self.assertEqual(download.call_count, 1)
         self.coordinator.firewall.pair.assert_called_once_with("127.0.0.1")
+        self.assertFalse(list(self.root.glob('tcpfit-*.ps1')))
+
+    def test_cmd_join_pairs_and_cleans_temporary_script(self):
+        process = subprocess.Popen('"{}" /d /s /c "{}"'.format(os.environ['COMSPEC'], self.windows_join()),
+                                   env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.addCleanup(self.stop_client, process)
+        output = process.communicate(timeout=25)[0]
+        self.assertEqual(process.returncode, 0, output)
+        self.coordinator.firewall.pair.assert_called_once_with('127.0.0.1')
+        self.assertFalse(list(self.root.glob('tcpfit-*.ps1')))
+
+    def test_failed_download_does_not_execute_existing_script_and_cleans_it(self):
+        with mock.patch.object(MODULE, 'client_script_url', return_value='http://127.0.0.1:{}/missing'.format(
+                self.args.control_port)):
+            command = MODULE.join_command(self.args, self.coordinator.token, 'windows')
+        name = re.search(r"-OutFile '([^']+)'", command).group(1)
+        script = self.root / name
+        marker = self.root / 'unexpected.txt'
+        script.write_text("Set-Content -LiteralPath {} -Value unexpected".format(ps_quote(marker)), encoding='utf-8-sig')
+        status, output = self.run_client(command)
+        self.assertNotEqual(status, 0, output)
+        self.assertFalse(marker.exists())
+        self.assertFalse(script.exists())
+        self.coordinator.firewall.pair.assert_not_called()
 
     def test_expired_token_fails_after_download_with_default_error_handling(self):
         self.coordinator.expires = time.monotonic() - 1
@@ -217,6 +246,7 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.assertNotEqual(status, 0, output)
         self.assertIn("临时 token 已过期", output)
         self.coordinator.firewall.pair.assert_not_called()
+        self.assertFalse(list(self.root.glob('tcpfit-*.ps1')))
 
     def test_windows_join_from_standard_input_pairs_and_finishes(self):
         code = "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n"
@@ -274,7 +304,8 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.coordinator.next_job.return_value = "RUN {} 2 1".format(secrets.token_hex(8))
         token = self.coordinator.token
         join = self.windows_join(token)
-        process = self.launch(join)
+        # 直接运行内部命令，以便只终止执行测速脚本的进程，检查它能否自动回收 iperf3。
+        process = self.launch(join.split(' -Command "', 1)[1][:-1])
         marker = self.root / "child.pid"
         deadline = time.monotonic() + 10
         while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
