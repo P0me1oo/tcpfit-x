@@ -142,7 +142,7 @@ class PortReservationTests(unittest.TestCase):
                             self.assertEqual(response.read(), (ROOT / "tcpfit-client.sh").read_bytes())
                         finally:
                             connection.close()
-                        self.assertIn(":{}/j/{}.sh".format(args.control_port, coordinator.token),
+                        self.assertIn(MODULE.client_script_url("tcpfit-client.sh"),
                                       MODULE.join_command(args, coordinator.token, "linux"))
                         if interrupted:
                             raise KeyboardInterrupt()

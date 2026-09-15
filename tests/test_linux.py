@@ -211,7 +211,8 @@ with m.reserve_ports(args) as reservations:
             MODULE.start_http(coordinator)
             control_port = coordinator.httpd.server_address[1]
             env = dict(os.environ, TMPDIR=str(directory))
-            client = subprocess.Popen(["sh", str(ROOT / "tcpfit-client.sh"), "127.0.0.1", str(control_port), "45212", coordinator.token], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            client = subprocess.Popen(["sh", str(ROOT / "tcpfit-client.sh"), "-e", "127.0.0.1:{}".format(control_port),
+                                       "-p", "45212", "-t", coordinator.token], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             try:
                 deadline = time.monotonic() + 10
                 while not coordinator.paired.is_set() and time.monotonic() < deadline:

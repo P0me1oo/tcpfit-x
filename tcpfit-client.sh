@@ -1,7 +1,7 @@
 #!/bin/sh
 # tcpfit 优化线路调优测速端：兼容常规 Linux、OpenWrt、iStoreOS 的 /bin/sh。
 # 本脚本只安装缺少的工具、主动连接和回报测量；不修改网络参数或启动入站服务。
-TCPFIT_CLIENT_VERSION="0.18.3"
+TCPFIT_CLIENT_VERSION="0.21.0"
 set -u
 umask 077
 
@@ -161,11 +161,32 @@ run_test(){
 main(){
   if [ "${1:-}" = --help ] || [ $# = 0 ]; then
     printf '%s\n' '这是优化线路调优测速端脚本。请执行调优端生成的完整接入命令。' \
-      '用法: sh tcpfit-client.sh 服务器IP 接入端口 测速端口 临时token'
+      '用法: sh tcpfit-client.sh -e 服务器IP:接入端口 -p 测速端口 -t 临时token' \
+      'IPv6 服务器地址写成 -e [地址]:接入端口'
     return 0
   fi
-  [ $# = 4 ] || abort "接入参数不完整，请重新复制调优端的命令"
-  server="$1"; control_port="$2"; iperf_port="$3"; token="$4"
+  endpoint=""; iperf_port=""; token=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -e|-p|-t)
+        [ $# -ge 2 ] || abort "参数 $1 缺少取值，请重新复制调优端的命令"
+        case "$1" in
+          -e) endpoint="$2" ;;
+          -p) iperf_port="$2" ;;
+          *)  token="$2" ;;
+        esac
+        shift 2 ;;
+      *) abort "无法识别的接入参数 $1，请重新复制调优端的命令" ;;
+    esac
+  done
+  [ -n "$endpoint" ] && [ -n "$iperf_port" ] && [ -n "$token" ] || abort "接入参数不完整，请重新复制调优端的命令"
+  # -e 同时给出服务器地址和接入端口；IPv6 必须加方括号，避免与端口分隔符混淆。
+  case "$endpoint" in
+    "["*"]:"*) server=${endpoint%"]:"*}; server=${server#"["}; control_port=${endpoint##*"]:"} ;;
+    *:*:*) abort "IPv6 接入地址需要写成 -e [地址]:接入端口" ;;
+    *:*) server=${endpoint%:*}; control_port=${endpoint##*:} ;;
+    *) abort "-e 需要写成 服务器IP:接入端口" ;;
+  esac
   case "$server" in ''|*[!a-fA-F0-9.:]*) abort "接入地址必须是调优端生成的 IP 地址" ;; esac
   case "$control_port:$iperf_port" in *[!0-9:]*|:*) abort "端口格式无效" ;; esac
   [ "$control_port" -ge 1024 ] && [ "$control_port" -le 65535 ] && [ "$iperf_port" -ge 1024 ] && [ "$iperf_port" -le 65535 ] || abort "端口超出范围"

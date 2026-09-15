@@ -36,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.18.3"
+VERSION="0.21.0"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -3158,8 +3158,13 @@ cmd_return(){
   [ -z "$client_bw" ] || args+=(--client-bw "$client_bw")
   python3 "$RETURN_HELPER" "${args[@]}" &
   local pid=$! rc=0
-  trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 130' INT TERM HUP
-  wait "$pid" || rc=$?
+  trap 'kill -INT "$pid" 2>/dev/null || :' INT
+  trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 130' TERM HUP
+  # Ctrl+C 只停止测速，入口继续等待协调进程完成配置选择。
+  while true; do
+    wait "$pid" && rc=0 || rc=$?
+    kill -0 "$pid" 2>/dev/null || break
+  done
   trap - INT TERM HUP
   return "$rc"
 }

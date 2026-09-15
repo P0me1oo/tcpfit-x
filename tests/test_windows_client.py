@@ -108,8 +108,16 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         MODULE.start_http(self.coordinator)
         self.addCleanup(self.coordinator.close)
 
+    def windows_join(self, token=None):
+        """接入命令改为从 GitHub 下载；回归测试指向调优端自带的同名入口，不依赖外网。"""
+        token = self.coordinator.token if token is None else token
+        host = "[::1]" if self.args.family == 6 else "127.0.0.1"
+        local = "http://{}:{}/join.ps1".format(host, self.args.control_port)
+        with mock.patch.object(MODULE, "client_script_url", return_value=local):
+            return MODULE.join_command(self.args, token, "windows")
+
     def launch(self, code=None):
-        code = code or MODULE.join_command(self.args, self.coordinator.token, "windows")
+        code = code or self.windows_join()
         code = "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n$ErrorActionPreference = 'Stop'\n" + code
         encoded = base64.b64encode(code.encode("utf-16-le")).decode("ascii")
         process = subprocess.Popen([self.shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
@@ -181,39 +189,38 @@ class WindowsPowerShell51Tests(unittest.TestCase):
 
     def test_direct_file_supports_explicit_binary_path_and_chinese(self):
         self.binary.rename(self.root / "explicit iperf3.exe")
-        values = [ROOT / "tcpfit-client.ps1", self.args.server, self.args.control_port,
-                  self.args.iperf_port, self.coordinator.token]
-        code = "& " + " ".join(map(ps_quote, values)) + " -IperfPath " + ps_quote(self.root / "explicit iperf3.exe")
+        code = "& {} -e {} -p {} -t {} -IperfPath {}".format(
+            ps_quote(ROOT / "tcpfit-client.ps1"), ps_quote("{}:{}".format(self.args.server, self.args.control_port)),
+            self.args.iperf_port, ps_quote(self.coordinator.token),
+            ps_quote(self.root / "explicit iperf3.exe"))
         status, output = self.run_client(code)
         self.assertEqual(status, 0, output)
         self.assertIn("Windows 接入完成", output)
 
     def test_explicit_windows_command_remains_supported(self):
-        status, output = self.run_client(MODULE.join_command(self.args, self.coordinator.token, "windows"))
+        status, output = self.run_client(self.windows_join())
         self.assertEqual(status, 0, output)
         self.coordinator.firewall.pair.assert_called_once_with("127.0.0.1")
 
-    def test_windows_join_downloads_once_and_bypasses_default_proxy(self):
-        code = "[Net.WebRequest]::DefaultWebProxy = [Net.WebProxy]::new('http://127.0.0.1:1');"
-        code += MODULE.join_command(self.args, self.coordinator.token, "windows")
-        with mock.patch.object(self.coordinator, "join_script", wraps=self.coordinator.join_script) as download:
-            token = self.coordinator.token
-            status, output = self.run_client(code)
+    def test_windows_join_downloads_the_script_only_once(self):
+        with mock.patch.object(MODULE, "windows_client_script", wraps=MODULE.windows_client_script) as download:
+            status, output = self.run_client(self.windows_join())
             self.assertEqual(status, 0, output)
             self.assertIn("Windows 接入完成", output)
-            download.assert_called_once_with(token, "ps1")
+            self.assertEqual(download.call_count, 1)
         self.coordinator.firewall.pair.assert_called_once_with("127.0.0.1")
 
-    def test_windows_join_rejects_expired_download_with_default_error_handling(self):
+    def test_expired_token_fails_after_download_with_default_error_handling(self):
         self.coordinator.expires = time.monotonic() - 1
-        code = "$ErrorActionPreference = 'Continue';" + MODULE.join_command(self.args, self.coordinator.token, "windows")
+        code = "$ErrorActionPreference = 'Continue';" + self.windows_join()
         status, output = self.run_client(code)
         self.assertNotEqual(status, 0, output)
+        self.assertIn("临时 token 已过期", output)
         self.coordinator.firewall.pair.assert_not_called()
 
     def test_windows_join_from_standard_input_pairs_and_finishes(self):
         code = "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n"
-        code += "$ErrorActionPreference = 'Stop'\n" + MODULE.join_command(self.args, self.coordinator.token, "windows") + "\n"
+        code += "$ErrorActionPreference = 'Stop'\n" + self.windows_join() + "\n"
         process = subprocess.Popen([self.shell, "-NoProfile", "-NonInteractive", "-Command", "-"],
                                    env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
@@ -266,7 +273,7 @@ class WindowsPowerShell51Tests(unittest.TestCase):
         self.env["TCPFIT_TEST_MODE"] = "hang"
         self.coordinator.next_job.return_value = "RUN {} 2 1".format(secrets.token_hex(8))
         token = self.coordinator.token
-        join = MODULE.join_command(self.args, token, "windows")
+        join = self.windows_join(token)
         process = self.launch(join)
         marker = self.root / "child.pid"
         deadline = time.monotonic() + 10
@@ -276,8 +283,10 @@ class WindowsPowerShell51Tests(unittest.TestCase):
             self.stop_client(process)
             self.fail("替代测速进程未启动")
         # 短链接在配对后失效；本地脚本直接启动仍由客户端任务锁拦截。
-        values = (ROOT / "tcpfit-client.ps1", self.args.server, self.args.control_port, self.args.iperf_port, token)
-        duplicate, output = self.run_client("& " + " ".join(map(ps_quote, values)))
+        duplicate, output = self.run_client("& {} -e {} -p {} -t {}".format(
+            ps_quote(ROOT / "tcpfit-client.ps1"),
+            ps_quote("{}:{}".format(self.args.server, self.args.control_port)),
+            self.args.iperf_port, ps_quote(token)))
         self.assertNotEqual(duplicate, 0, output)
         self.assertIn("已有测速端任务", output)
         self.assertIsNone(self.coordinator.error)

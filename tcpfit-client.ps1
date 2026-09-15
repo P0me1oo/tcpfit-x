@@ -1,15 +1,14 @@
 ﻿#requires -Version 5.1
 # Windows 测速端：只主动接入、接收测试数据和回报结果。
 param(
-    [string]$Server,
-    [int]$ControlPort,
-    [int]$IperfPort,
-    [string]$Token,
+    [Alias('e')][string]$Endpoint,
+    [Alias('p')][int]$IperfPort,
+    [Alias('t')][string]$Token,
     [string]$IperfPath,
     [switch]$Help
 )
 
-$TCPFIT_CLIENT_VERSION = '0.18.3'
+$TCPFIT_CLIENT_VERSION = '0.21.0'
 
 function Initialize-TcpfitProcessJob {
     # 由系统在 PowerShell 被强制关闭时终止本任务的子进程，无需凭据文件或守护脚本。
@@ -248,14 +247,22 @@ function Invoke-TcpfitTest($Context, [string]$Id, [int]$Duration, [int]$Streams)
 function Invoke-TcpfitClient {
     Set-StrictMode -Version 2.0
     $ErrorActionPreference = 'Stop'
-    if ($Help -or -not ($Server -or $ControlPort -or $IperfPort -or $Token)) {
+    if ($Help -or -not ($Endpoint -or $IperfPort -or $Token)) {
         Write-Host '请在 PowerShell 中执行调优端生成的 Windows 接入命令。'
-        Write-Host '用法: .\tcpfit-client.ps1 服务器IP 接入端口 测速端口 临时token [-IperfPath C:\路径\iperf3.exe]'
+        Write-Host '用法: .\tcpfit-client.ps1 -e 服务器IP:接入端口 -p 测速端口 -t 临时token [-IperfPath C:\路径\iperf3.exe]'
+        Write-Host 'IPv6 服务器地址写成 -e [地址]:接入端口'
         return
     }
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw '本脚本仅用于 Windows 测速端' }
+    # -e 同时给出服务器地址和接入端口；IPv6 必须加方括号，避免与端口分隔符混淆。
+    if ($Endpoint -cmatch '^\[([0-9a-fA-F:.]+)\]:([0-9]{1,5})$' -or $Endpoint -cmatch '^([0-9a-fA-F.]+):([0-9]{1,5})$') {
+        $serverText = $Matches[1]
+        $ControlPort = [int]$Matches[2]
+    } else {
+        throw '-e 需要写成 服务器IP:接入端口，IPv6 写成 [地址]:接入端口'
+    }
     $address = $null
-    if ($Server -notmatch '^[a-fA-F0-9.:]+$' -or -not [Net.IPAddress]::TryParse($Server, [ref]$address)) { throw '接入地址必须是调优端生成的 IP 地址' }
+    if (-not [Net.IPAddress]::TryParse($serverText, [ref]$address)) { throw '接入地址必须是调优端生成的 IP 地址' }
     if ($ControlPort -lt 1024 -or $ControlPort -gt 65535 -or $IperfPort -lt 1024 -or $IperfPort -gt 65535 -or $ControlPort -eq $IperfPort) { throw '端口必须为 1024-65535 且互不相同' }
     if ($Token -cnotmatch '^[a-zA-Z0-9_-]{32}$') { throw '临时 token 格式无效，请重新复制完整接入命令' }
     $family = if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) { 6 } else { 4 }

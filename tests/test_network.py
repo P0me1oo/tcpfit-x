@@ -144,7 +144,7 @@ class NetworkIntegrationTests(unittest.TestCase):
     def test_old_firewall_record_still_cleans_only_its_rules(self):
         self.exercise_filter("iptables", legacy_record=True)
 
-    def test_http_join_download_with_curl_or_wget_only(self):
+    def test_http_join_download_with_wget_only(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             script = directory / "join.sh"
@@ -155,18 +155,22 @@ class NetworkIntegrationTests(unittest.TestCase):
             MODULE.start_http(coordinator)
             args.control_port = coordinator.httpd.server_address[1]
             try:
-                for downloader in ("curl", "wget"):
-                    with self.subTest(downloader=downloader):
-                        self.assertIsNotNone(shutil.which(downloader), "本用例需要已有的 " + downloader)
-                        tools = directory / downloader
-                        tools.mkdir()
-                        (tools / "sh").symlink_to(shutil.which("sh"))
-                        (tools / downloader).symlink_to(shutil.which(downloader))
-                        result = subprocess.run(["/bin/sh", "-c", MODULE.join_command(args, coordinator.token, "linux")],
-                                                env=dict(os.environ, PATH=str(tools), http_proxy="", HTTP_PROXY=""),
-                                                capture_output=True, text=True, timeout=10)
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(result.stdout.splitlines(), [args.server, str(args.control_port), "45212", coordinator.token])
+                self.assertIsNotNone(shutil.which("wget"), "本用例需要已有的 wget")
+                tools = directory / "wget-only"
+                tools.mkdir()
+                (tools / "sh").symlink_to(shutil.which("sh"))
+                (tools / "wget").symlink_to(shutil.which("wget"))
+                # 接入命令改为从 GitHub 下载；这里指向调优端自带的入口，避免回归测试依赖外网。
+                local = "http://127.0.0.1:{}/join.sh".format(args.control_port)
+                with mock.patch.object(MODULE, "client_script_url", return_value=local):
+                    command = MODULE.join_command(args, coordinator.token, "linux")
+                result = subprocess.run(["/bin/sh", "-c", command],
+                                        env=dict(os.environ, PATH=str(tools), http_proxy="", HTTP_PROXY=""),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                                 ["-e", "{}:{}".format(args.server, args.control_port),
+                                  "-p", "45212", "-t", coordinator.token])
             finally:
                 coordinator.close()
 
@@ -187,7 +191,8 @@ class NetworkIntegrationTests(unittest.TestCase):
             coordinator = MODULE.Coordinator(args, runtime, runtime, firewall)
             MODULE.start_http(coordinator)
             args.control_port = coordinator.httpd.server_address[1]
-            client = subprocess.Popen(["sh", args.client_script, args.server, str(args.control_port), str(port), coordinator.token],
+            client = subprocess.Popen(["sh", args.client_script, "-e", "{}:{}".format(args.server, args.control_port),
+                                       "-p", str(port), "-t", coordinator.token],
                                       env=dict(os.environ, TMPDIR=str(directory)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             try:
                 deadline = time.monotonic() + 10
