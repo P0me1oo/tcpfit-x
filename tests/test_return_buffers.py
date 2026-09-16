@@ -829,7 +829,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
     def test_complete_flow_applies_initial_values_before_testing_and_reuses_retained_measurements(self):
         result, output = self.exercise_flow(True)
         self.assertTrue(result["base_kept"])
-        self.assertEqual(result["buffers_final"], buffer_state(15))
+        self.assertEqual(result["buffers_final"], buffer_state(14))
         self.assertNotEqual(result["final"], result["after"])
         self.assertIn("最终配置需复测确认", output)
         self.assertNotEqual(result["after"], result["initial_after"])
@@ -853,7 +853,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
         self.assertNotIn("path_bandwidth", result)
         self.assertEqual(result["reference_bandwidth"], 200)
         self.assertEqual(result["rtt_ms"], 100)
-        self.assertIn("最终缓冲区：接收 15 MiB / 发送 15 MiB", output)
+        self.assertIn("最终缓冲区：接收 14 MiB / 发送 14 MiB", output)
         self.assertNotIn("max_rounds", result["buffer_search"])
         self.assertNotIn("no_gain_limit", result["buffer_search"])
         self.assertIn("停止原因", output)
@@ -865,7 +865,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
     def test_excellent_initial_values_grow_and_reuse_the_faster_configuration_results(self):
         result, output = self.exercise_flow(True, excellent_initial=True)
         self.assertTrue(result["base_kept"])
-        self.assertEqual(result["buffers_final"], buffer_state(FLOW_LIMIT / MIB))
+        self.assertEqual(result["buffers_final"], buffer_state(20))
         self.assertEqual([trial["target_max_bytes"] for trial in result["buffer_trials"]],
                          [value * MIB for value in (18, 20, 22, 24, 26)] + [FLOW_LIMIT])
         self.assertTrue(all(trial["kept"] for trial in result["buffer_trials"]))
@@ -873,16 +873,25 @@ class ReturnBufferFlowTests(unittest.TestCase):
         self.assertNotEqual(result["final"], result["buffer_trials"][-1]["measurements"])
         self.assertIn("优先保留更大缓冲区", output)
 
-    def test_complete_flow_saves_largest_buffer_with_flat_speed_and_retransmission_below_one_percent(self):
+    def test_equal_speed_keeps_first_candidate_without_buffer_size_preference(self):
         result, output = self.exercise_flow(True, excellent_initial=True, trial_speeds=(99, 99), trial_retrans=(0.8, 0.8))
         self.assertTrue(result["base_kept"])
-        self.assertEqual(result["buffers_final"], buffer_state(FLOW_LIMIT / MIB))
+        self.assertEqual(result["buffers_final"], buffer_state(16))
         self.assertEqual([row["receiver_mbps"] for row in result["final"]], [99, 99])
-        self.assertEqual([row["estimated_retrans_pct"] for row in result["final"]], [0.8, 0.8])
-        self.assertEqual(result["recommended_validation"], "通过")
+        self.assertEqual([row["estimated_retrans_pct"] for row in result["final"]], [0, 0])
+        self.assertEqual(result["recommended_validation"], "重传不超过 1%，有效单连接速度中位数最快")
         self.assertEqual(result["goal_reasons"], [])
         self.assertTrue(result["buffer_search"]["prefer_larger"])
         self.assertNotIn("speed_gain_min", result["buffer_search"])
+
+    def test_fastest_initial_candidate_is_saved_without_extra_measurements(self):
+        result, _ = self.exercise_flow(True, excellent_initial=True, initial_speeds=(100, 100),
+                                       trial_speeds=(99, 99), trial_retrans=(0.8, 0.8))
+        self.assertEqual(result["recommended_number"], 1)
+        self.assertEqual(result["buffers_final"], buffer_state(16))
+        self.assertEqual([row["receiver_mbps"] for row in result["final"]], [100, 100])
+        self.assertEqual(len(result["measurements"]), 2 * (1 + len(result["buffer_trials"])))
+        self.assertFalse(any(row["stage"] == "最终配置验证" for row in result["measurements"]))
 
     def test_final_queue_validation_uses_one_percent_threshold(self):
         for ratio, kept in ((0.8, True), (1, True), (1.001, False)):
@@ -906,7 +915,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
         result, output = self.exercise_flow(False)
         self.assertTrue(result["base_kept"])
         self.assertFalse(result["buffer_trials"][0]["kept"])
-        self.assertEqual(result["buffers_final"], buffer_state(15))
+        self.assertEqual(result["buffers_final"], buffer_state(12))
         self.assertNotEqual(result["final"], result["after"])
         self.assertIn("最终配置需复测确认", output)
         self.assertIn("比稳定参照下降超过 5%", output)
@@ -916,7 +925,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
         self.assertFalse(result["base_kept"])
         self.assertEqual(result["buffers_final"], buffer_state(8))
         self.assertEqual(result["final_rate"], 150)
-        self.assertIn("已恢复原配置", result["recommended_validation"])
+        self.assertIn("重传不超过 1%", result["recommended_validation"])
 
     def test_idle_latency_is_measured_before_bdp_and_falls_back_explicitly(self):
         for means, expected, source in (((100.2, 102.2), 102, "实测"), ((None, None), 100, "默认估值")):
@@ -933,8 +942,8 @@ class ReturnBufferFlowTests(unittest.TestCase):
         self.assertEqual(result["speed_reference"], "first_stable_after")
         self.assertEqual(result["first_stable_after"], result["buffer_trials"][0]["measurements"])
         self.assertEqual(result["buffer_search"]["speed_reference_round"], 1)
-        self.assertEqual(result["buffers_final"], buffer_state(FLOW_LIMIT / MIB))
-        self.assertEqual(result["final"], result["after"])
+        self.assertEqual(result["buffers_final"], buffer_state(14))
+        self.assertEqual(result["final"], result["first_stable_after"])
         self.assertIn("初值测速不稳定，继续试调", output)
         self.assertFalse(any("未取得稳定测速参照" in reason for reason in result["base_reasons"]))
 
@@ -951,21 +960,21 @@ class ReturnBufferFlowTests(unittest.TestCase):
                     old_rate=150, final_regression=regression)
                 self.assertEqual(result["speed_reference"], "first_stable_after")
                 self.assertEqual(result["base_kept"], not regression)
-                self.assertEqual(result["buffers_final"], buffer_state(8 if regression else FLOW_LIMIT / MIB))
+                self.assertEqual(result["buffers_final"], buffer_state(8 if regression else 14))
                 self.assertTrue(any(row["stage"] == "最终配置验证" for row in result["measurements"]))
                 if regression:
                     self.assertTrue(any("比稳定参照下降超过 5%" in reason for reason in result["base_reasons"]))
                 else:
-                    self.assertEqual(result["recommended_validation"], "通过")
+                    self.assertEqual(result["recommended_validation"], "重传不超过 1%，有效单连接速度中位数最快")
 
-    def test_unstable_results_throughout_stop_at_bdp_floor_before_recommending_the_original_configuration(self):
+    def test_unstable_results_keep_warning_and_recommend_fastest_under_retransmission_threshold(self):
         result, output = self.exercise_flow(True, initial_speeds=(100, 200), trial_speeds=(99, 150))
         self.assertFalse(result["base_kept"])
         self.assertIsNone(result["speed_reference"])
         self.assertLess(len(result["buffer_trials"]), 9)
         self.assertTrue(all(not trial["kept"] for trial in result["buffer_trials"]))
-        self.assertEqual(result["buffers_final"], buffer_state(16))
-        self.assertEqual(result["recommended_validation"], "有效测速中速度最快，未通过完整验收")
+        self.assertEqual(result["buffers_final"], buffer_state(14))
+        self.assertEqual(result["recommended_validation"], "重传不超过 1%，有效单连接速度中位数最快")
         self.assertTrue(result["buffer_search"]["selection_required"])
         self.assertIn("已测到缓冲区下限", result["buffer_search"]["stop_reason"])
 
@@ -985,7 +994,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
                 self.assertEqual(result["path_bandwidth"], expected)
                 self.assertEqual(result["bandwidth_source"], "四连接实测路径带宽")
                 self.assertEqual(result["rtt_ms"], 100)
-                self.assertEqual(result["buffers_final"], buffer_state(15))
+                self.assertEqual(result["buffers_final"], buffer_state(14))
                 self.assertIn("四连接实测路径带宽", output)
 
     def test_either_nominal_bandwidth_skips_probe_in_complete_flow(self):
@@ -1036,13 +1045,14 @@ class ReturnBufferFlowTests(unittest.TestCase):
 
     def test_existing_shaper_keeps_four_connection_checks_and_single_connection_final_guard(self):
         result, _ = self.exercise_flow(True, old_rate=150)
-        self.assertGreater(result["final_rate"], 150)
+        self.assertIsNone(result["final_rate"])
         for key in ("initial_after", "after"):
             self.assertEqual([row["streams"] for row in result[key]], [1, 1])
         for key in ("shape_reference", "shape_measurements"):
             self.assertEqual([row["streams"] for row in result[key]], [4, 4])
             self.assertTrue(all(row["buffers"] == buffer_state(15) for row in result[key]))
-        self.assertEqual([row["streams"] for row in result["final"]], [1, 1, 4, 4])
+        self.assertEqual([row["streams"] for row in result["final"]], [1, 1])
+        self.assertEqual([row["streams"] for row in result["measurements"] if row["stage"] == "最终配置验证"], [1, 1, 4, 4])
         self.assertFalse(any("带宽探测" in row["stage"] for row in result["measurements"]))
 
     def test_rate_limit_is_reported_before_removal_and_unlimited_is_not_mislabelled(self):
@@ -1060,10 +1070,10 @@ class ReturnBufferFlowTests(unittest.TestCase):
 
     def test_failed_four_connection_shaper_validation_restores_old_rate(self):
         result, _ = self.exercise_flow(True, old_rate=150, shape_passes=False)
-        self.assertEqual(result["final_rate"], 150)
+        self.assertIsNone(result["final_rate"])
         self.assertTrue(result["base_kept"])
-        self.assertEqual(result["buffers_final"], buffer_state(15))
-        self.assertIn("候选未通过", result["shape_reason"])
+        self.assertEqual(result["buffers_final"], buffer_state(14))
+        self.assertTrue(any("test-shape" == action[0] for action in self.flow_actions))
         self.assertEqual([row["streams"] for row in result["final"]], [1, 1])
 
     def test_measurement_failure_disconnect_and_interrupt_list_partial_results_for_selection(self):
@@ -1073,23 +1083,23 @@ class ReturnBufferFlowTests(unittest.TestCase):
                 self.assertEqual(result["buffer_trials"][0]["status"], "failed")
                 self.assertEqual(result["buffer_trials"][0]["restored"], buffer_state(16))
                 self.assertEqual(result["status"], "completed")
-                self.assertEqual(result["buffers_final"], buffer_state(16))
+                self.assertEqual(result["buffers_final"], buffer_state(8))
                 self.assertIn("列出已测结果", output)
-                self.assertIn("推荐有效接收速度中位数最快", output)
+                self.assertIn("推荐重传不超过 1% 且有效单连接速度中位数最快", output)
 
     def test_ctrl_c_during_a_measurement_enters_the_same_partial_selection(self):
         result, output = self.exercise_flow(True, signal_after_samples=3)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["selection_reason"], "测速已中断")
-        self.assertEqual(result["buffers_final"], buffer_state(16))
+        self.assertEqual(result["buffers_final"], buffer_state(8))
         self.assertIn("列出已测结果", output)
 
-    def test_ctrl_c_after_one_sample_can_still_recommend_the_partial_configuration(self):
+    def test_ctrl_c_with_only_high_retransmission_results_recommends_zero(self):
         result, output = self.exercise_flow(True, signal_after_samples=2)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["selection_reason"], "测速已中断")
         self.assertEqual(result["recommended_config"], result["selected_config"])
-        self.assertEqual(len(result["final"]), 1)
+        self.assertEqual(len(result["final"]), 0)
         self.assertIn("未完成", output)
 
     def test_partial_buffer_application_failure_restores_the_original_snapshot(self):

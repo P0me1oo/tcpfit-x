@@ -3,6 +3,7 @@ import http.client
 import importlib.util
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import types
 import unittest
@@ -15,6 +16,46 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PortReservationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "验证 Linux TIME_WAIT 端口复用语义")
+    def test_immediate_restart_with_time_wait(self):
+        for family in (4, 6):
+            for name in ("control_port", "iperf_port"):
+                with self.subTest(family=family, port=name):
+                    host = "127.0.0.1" if family == 4 else "::1"
+                    with self.socket(family) as listener, self.socket(family) as client:
+                        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        listener.bind((host, 0))
+                        port = listener.getsockname()[1]
+                        listener.listen(1)
+                        client.settimeout(5)
+                        client.connect((host, port))
+                        connection, _ = listener.accept()
+                        # 服务端先关闭，让服务端端口进入 TIME_WAIT。
+                        connection.close()
+                        self.assertEqual(client.recv(1), b"")
+                    with self.socket(family) as probe:
+                        with self.assertRaises(OSError):
+                            probe.bind((host, port))
+                    args = self.args(family)
+                    setattr(args, name, port)
+                    with MODULE.reserve_ports(args) as reservations:
+                        self.assertEqual(getattr(args, name), port)
+                        reservations[name].listen(1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "验证 Linux 监听端口不可抢占")
+    def test_reuse_does_not_take_over_live_listener(self):
+        for family in (4, 6):
+            with self.subTest(family=family), self.socket(family) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("0.0.0.0" if family == 4 else "::", 0))
+                listener.listen(1)
+                for name in ("control_port", "iperf_port"):
+                    args = self.args(family)
+                    setattr(args, name, listener.getsockname()[1])
+                    with self.assertRaisesRegex(MODULE.TaskError, "已被占用"):
+                        with MODULE.reserve_ports(args):
+                            self.fail("不能抢占已启用地址复用的监听端口")
+
     def args(self, family=4, control=0, iperf=0):
         return types.SimpleNamespace(family=family, control_port=control, iperf_port=iperf,
                                      server="127.0.0.1" if family == 4 else "::1", token_ttl=60,

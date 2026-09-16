@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.22.0"
+VERSION = "0.22.2"
 REPO = "P0me1oo/tcpfit-x"
 # 测速端脚本从 GitHub 按版本标签下载，保证两端脚本同版本。
 CLIENT_SCRIPT_RAW = "https://raw.githubusercontent.com/{repo}/refs/tags/v{version}/{name}"
@@ -88,6 +88,10 @@ def reserve_ports(args):
             sock = socket.socket(family, socket.SOCK_STREAM)
             reservations[name] = sock
             try:
+                # Linux 允许复用上次连接的 TIME_WAIT，必须在预留绑定前设置。
+                # Windows 的同名选项允许共享监听端口，不在该平台启用。
+                if sys.platform.startswith("linux"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 if family == socket.AF_INET6:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
                 sock.bind((address, port))
@@ -1976,20 +1980,19 @@ def buffer_floor_met(buffers, minimum):
 
 
 def fastest_configuration(book, minimum):
-    """按同一配置的有效速度中位数推荐；优先比较单连接，不混合连接数。"""
+    """按已有有效单连接记录推荐重传阈值内速度中位数最快的配置。"""
     groups = [group for group in configuration_groups(book) if buffer_floor_met(group["buffers"], minimum)]
-    for streams in (1, 4):
-        candidates = []
-        for group in groups:
-            try:
-                speed = median_metric(group["measurements"], streams, "receiver_mbps")
-                median_metric(group["measurements"], streams, "estimated_retrans_pct")
-            except TaskError:
-                continue
+    candidates = []
+    for group in groups:
+        records = group["measurements"]
+        try:
+            speed = median_metric(records, 1, "receiver_mbps")
+            retrans = median_metric(records, 1, "estimated_retrans_pct")
+        except TaskError:
+            continue
+        if retrans <= RETRANS_TARGETS[1][1]:
             candidates.append((speed, -group["number"], group["config_id"]))
-        if candidates:
-            return max(candidates)[2]
-    return None
+    return max(candidates)[2] if candidates else None
 
 
 def measurement_table(book, recommendation=None, minimum=1):
@@ -2027,14 +2030,14 @@ def measurement_table(book, recommendation=None, minimum=1):
 
 def select_configuration(book, recommendation, automatic=False, reader=None, check=None, minimum=1):
     groups = configuration_groups(book, recommendation)
-    if not buffer_floor_met(buffers_from_sysctl(book.configurations[recommendation]["sysctl"]), minimum):
+    if recommendation is not None and not buffer_floor_met(buffers_from_sysctl(book.configurations[recommendation]["sysctl"]), minimum):
         raise TaskError("推荐配置的缓冲区低于 BDP÷2，不能保存")
-    recommended_number = next(group["number"] for group in groups if recommendation in group["config_ids"])
+    recommended_number = next((group["number"] for group in groups if recommendation in group["config_ids"]), 0)
     if check:
         check()
     if automatic:
         log("保存推荐配置 {}".format(recommended_number))
-        return recommendation, None
+        return (recommendation, None) if recommendation is not None else (None, 0)
     # 调优协调进程在后台启动，必须从控制终端读取，不能依赖后台标准输入。
     terminal = None
     if reader is None:
@@ -2059,7 +2062,7 @@ def select_configuration(book, recommendation, automatic=False, reader=None, che
                 check()
             value = reader().strip()
             if not value:
-                return recommendation, None
+                return (recommendation, None) if recommendation is not None else (None, 0)
             normalized = value.lstrip("0") or "0"
             if re.fullmatch(r"[0-9]+", value) and len(normalized) <= len(str(len(groups))):
                 number = int(normalized)
@@ -2272,15 +2275,13 @@ def persist_selected_configuration(worker, snapshot):
 def save_configuration_choice(book, worker, result, recommendation, automatic, check):
     """正常完成和提前停止共用同一套选择、完整恢复与保存检查。"""
     minimum = result["buffer_plan"]["min_bytes"]
-    if not buffer_floor_met(buffers_from_sysctl(book.configurations[recommendation]["sysctl"]), minimum):
-        recommendation = fastest_configuration(book, minimum)
-        if recommendation is None:
-            raise TaskError("没有缓冲区不低于 BDP÷2 的有效测速配置")
-        result["recommended_validation"] = "有效测速中速度最快，未通过完整验收"
-    result["recommended_config"] = recommendation
+    recommendation = fastest_configuration(book, minimum)
+    result["recommended_validation"] = ("重传不超过 1%，有效单连接速度中位数最快"
+                                          if recommendation is not None else "无重传合格的候选，推荐不修改")
+    result["recommended_config"] = recommendation or result["original_config"]
     book.save()
     groups = measurement_table(book, recommendation, minimum)
-    print("0：不修改，恢复调优前配置", flush=True)
+    print("0：不修改，恢复调优前配置" + ("（推荐：无重传合格的候选）" if recommendation is None else ""), flush=True)
     result["configuration_options"] = [{"number": group["number"], "config_id": group["config_id"],
                                         "config_ids": group["config_ids"],
                                         "selectable": buffer_floor_met(group["buffers"], minimum) and (
@@ -2289,9 +2290,10 @@ def save_configuration_choice(book, worker, result, recommendation, automatic, c
                                        for group in groups]
     result["configuration_options"].append({"number": 0, "config_id": result["original_config"],
         "config_ids": [result["original_config"]], "selectable": True, "measurement_numbers": []})
-    recommended_group = next(group for group in groups if recommendation in group["config_ids"])
-    result["recommended_number"] = recommended_group["number"]
-    result["recommended_measurements"] = [row for row in recommended_group["measurements"] if row["status"] == "valid"]
+    recommended_group = next((group for group in groups if recommendation in group["config_ids"]), None)
+    result["recommended_number"] = recommended_group["number"] if recommended_group else 0
+    result["recommended_measurements"] = ([row for row in recommended_group["measurements"] if row["status"] == "valid"]
+                                           if recommended_group else [])
     selected, number = select_configuration(book, recommendation, automatic, check=check, minimum=minimum)
     check()
     if number == 0:
@@ -2616,7 +2618,7 @@ def run_prepared_task(args, reservations):
                        book is not None and any(row["status"] == "failed" for row in book.records)))
         minimum = result.get("buffer_plan", {}).get("min_bytes")
         recommendation = fastest_configuration(book, minimum) if can_select and book is not None and minimum else None
-        if recommendation is not None:
+        if can_select and book is not None and minimum and any(row["status"] == "valid" for row in book.records):
             try:
                 selection_state["active"] = True
                 worker.check = check_selection
@@ -2628,12 +2630,12 @@ def run_prepared_task(args, reservations):
                     raise TaskError("选择前恢复的实际缓冲区与调优前不一致")
                 result.update(selection_reason=reason, testing_complete=False, base_kept=False,
                               base_reasons=[reason], goal_reasons=["测速提前停止，未通过完整验收"],
-                              recommended_validation="有效测速中速度最快，未通过完整验收",
+                              recommended_validation="按已有有效测速选择，未通过完整验收",
                               shape_reason="测速提前停止，按所选配置保存")
                 result.setdefault("buffer_search", {})
                 result["buffer_search"].setdefault("stop_reason", "测速提前停止")
                 result["buffer_search"]["selection_required"] = True
-                log("{}；列出已测结果，推荐有效接收速度中位数最快的配置".format(reason))
+                log("{}；列出已测结果，推荐重传不超过 1% 且有效单连接速度中位数最快的配置".format(reason))
                 final_state = save_configuration_choice(book, worker, result, recommendation, args.yes, check_selection)
                 atomic_json(record_dir / "final.json", final_state)
                 if result["selected_number"] != 0:

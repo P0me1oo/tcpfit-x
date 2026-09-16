@@ -47,6 +47,54 @@ class RecordTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def add_candidate(self, maximum, speeds, retrans=0, **extra):
+        self.current = snapshot(maximum)
+        config_id = self.book.register()
+        for speed in speeds:
+            self.book.records.append(dict(number=len(self.book.records) + 1, config_id=config_id,
+                                          streams=1, status="valid", receiver_mbps=speed,
+                                          estimated_retrans_pct=retrans, repeats=1, **extra))
+        return config_id
+
+    def test_recommendation_uses_fastest_under_retransmission_threshold_from_report(self):
+        speeds = [415.33, 654.66, 762.24, 803.42, 640.78, 407.96, 650.01,
+                  411.94, 669.80, 674.28, 424.04, 660.74, 405.16, 421.11]
+        ids = [self.add_candidate(39.8755 + index * 2, [speed]) for index, speed in enumerate(speeds)]
+        self.add_candidate(66.4592, [711.46, 641.45], retrans=0.0015)
+        before = copy.deepcopy(self.book.records)
+        self.assertEqual(MODULE.fastest_configuration(self.book, 1), ids[3])
+        self.assertEqual(self.book.records, before)
+        self.worker.run.assert_not_called()
+
+    def test_faster_smaller_buffer_wins_even_with_less_than_three_percent_difference(self):
+        fastest = self.add_candidate(20, [800], retrans=1)
+        self.add_candidate(40, [799], retrans=0)
+        self.add_candidate(60, [900], retrans=1.001)
+        self.assertEqual(MODULE.fastest_configuration(self.book, 1), fastest)
+
+    def test_recommendation_uses_median_and_keeps_existing_stability_annotation(self):
+        self.add_candidate(20, [700, 900], stability="unstable")
+        fastest = self.add_candidate(22, [810, 810])
+        self.assertEqual(MODULE.fastest_configuration(self.book, 1), fastest)
+        self.book.records[-1]["receiver_mbps"] = 780
+        self.assertEqual(MODULE.fastest_configuration(self.book, 1), "C1")
+
+    def test_recommendation_does_not_mix_four_connection_results_or_bypass_floor(self):
+        self.add_candidate(8, [1000])
+        self.add_candidate(20, [950])
+        self.book.records[-1]["streams"] = 4
+        fastest = self.add_candidate(24, [800])
+        self.add_candidate(26, [900], retrans=2)
+        self.assertEqual(MODULE.fastest_configuration(self.book, 16 * MODULE.MIB), fastest)
+
+    def test_no_eligible_candidate_defaults_to_zero_but_allows_manual_choice(self):
+        self.add_candidate(20, [900], retrans=1.001)
+        self.assertIsNone(MODULE.fastest_configuration(self.book, 1))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(MODULE.select_configuration(self.book, None, automatic=True), (None, 0))
+        self.assertEqual(MODULE.select_configuration(self.book, None, reader=lambda: ""), (None, 0))
+        self.assertEqual(MODULE.select_configuration(self.book, None, reader=lambda: "1"), ("C1", 1))
+
     def test_default_and_custom_counts_are_totals_for_each_requested_mode(self):
         with redirect_stdout(io.StringIO()):
             baseline = self.book.measure_group("基线")
