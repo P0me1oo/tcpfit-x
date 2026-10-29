@@ -600,7 +600,8 @@ class ReturnBufferFlowTests(unittest.TestCase):
                       initial_speeds=None, initial_retrans=None, trial_speeds=None,
                       idle_means=(100, 100), final_regression=False, flow_rate=None,
                       trial_retrans=None, final_retrans=None, signal_after_samples=None,
-                      signal_kind=None, failure_sample=None):
+                      signal_kind=None, failure_sample=None, traffic_limit=None, sample_bytes=None,
+                      path_output="192.0.2.1 dev eth0"):
         probe_values = iter(probe_speeds) if probe_speeds is not None else None
         initial_values = iter(initial_speeds) if initial_speeds is not None else None
         initial_ratios = iter(initial_retrans) if initial_retrans is not None else None
@@ -699,6 +700,8 @@ class ReturnBufferFlowTests(unittest.TestCase):
                         sample["estimated_retrans_pct"] = final_retrans
                     if args[0] == 4 and self.queue_rate is not None and not shape_passes:
                         sample["receiver_mbps"] = old_rate - 1
+                    sample["sender_bytes"] = sample_bytes if sample_bytes is not None else int((sample["receiver_mbps"] or 0) * 1000000 * args[1] / 8)
+                    sample["receiver_bytes"] = sample["sender_bytes"]
                     coordinator.results.append(sample)
                     if signal_after_samples == len(sample_calls):
                         signal_handlers[signal_kind or MODULE.signal.SIGINT](signal_kind or MODULE.signal.SIGINT, None)
@@ -748,7 +751,8 @@ class ReturnBufferFlowTests(unittest.TestCase):
             args = types.SimpleNamespace(script=str(ROOT / "tcpfit.sh"), client_script=str(ROOT / "tcpfit-client.sh"),
                                          state_dir=str(task_dir / "state"), lock_fd=9, role="proxy", family=4,
                                          server="192.0.2.2", server_bw=server_bw, client_bw=client_bw, token_ttl=600,
-                                         control_port=0, iperf_port=0, repeats=2, yes=selection is None)
+                                         control_port=0, iperf_port=0, repeats=2, yes=selection is None,
+                                         traffic_limit_gb=traffic_limit)
             coordinator.run_dir = task_dir / "runtime"
             firewall = mock.Mock(state={"backend": "none", "manager": None}, path=task_dir / "firewall.json")
             guardian = mock.Mock()
@@ -785,7 +789,7 @@ class ReturnBufferFlowTests(unittest.TestCase):
                     mock.patch.object(MODULE.signal, "signal", side_effect=register_signal),
                     mock.patch.object(MODULE.time, "monotonic", side_effect=itertools.count(time.monotonic(), 1)),
                     mock.patch.object(MODULE.time, "sleep"),
-                    mock.patch.object(MODULE, "command", return_value=subprocess.CompletedProcess([], 0, "192.0.2.1 dev eth0", "")),
+                    mock.patch.object(MODULE, "command", return_value=subprocess.CompletedProcess([], 0, path_output, "")),
                     mock.patch.object(MODULE.QueueState, "capture"),
                     mock.patch.object(MODULE.QueueState, "restore", side_effect=restore_queue),
                     mock.patch.object(MODULE.Snapshot, "capture", side_effect=snapshot),
@@ -825,6 +829,28 @@ class ReturnBufferFlowTests(unittest.TestCase):
                                      "cubic" if selection == 1 and server_bw is None and client_bw is None else "bbr")
                     persist_call.assert_called_once()
             return result, output.getvalue()
+
+    def test_budget_stop_selects_partial_qualified_configuration_without_more_tests(self):
+        result, output = self.exercise_flow(True, traffic_limit=1, sample_bytes=400000000)
+        self.assertFalse(result["testing_complete"])
+        self.assertEqual(result["buffers_final"], buffer_state(14))
+        self.assertEqual(len([action for action in self.flow_actions if action[0] == "sample"]), 3)
+        self.assertTrue(result["traffic"]["limit_reached"])
+        self.assertIn("流量预算", result["buffer_search"]["stop_reason"])
+
+    def test_budget_during_path_probe_restores_original_without_tuning(self):
+        result, output = self.exercise_flow(True, server_bw=None, client_bw=None,
+                                           traffic_limit=1, sample_bytes=1200000000)
+        self.assertEqual(result["selected_number"], 0)
+        self.assertFalse(result["testing_complete"])
+        self.assertEqual(result["buffers_final"], buffer_state(8))
+        self.assertFalse(any(action[0] == "tune" for action in self.flow_actions))
+
+    def test_non_default_policy_route_is_used_for_queue_operations(self):
+        result, output = self.exercise_flow(True, path_output="192.0.2.1 dev eth1 table 100")
+        self.assertEqual((result["iface"], result["route_table"]), ("eth1", "100"))
+        self.assertIn(("fq", "eth1"), self.flow_actions)
+        self.assertNotIn(("fq", "eth0"), self.flow_actions)
 
     def test_complete_flow_applies_initial_values_before_testing_and_reuses_retained_measurements(self):
         result, output = self.exercise_flow(True)

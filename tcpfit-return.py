@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.22.2"
+VERSION = "0.23.0"
 REPO = "P0me1oo/tcpfit-x"
 # 测速端脚本从 GitHub 按版本标签下载，保证两端脚本同版本。
 CLIENT_SCRIPT_RAW = "https://raw.githubusercontent.com/{repo}/refs/tags/v{version}/{name}"
@@ -55,7 +55,13 @@ CONFIG_FILES = (
     "/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd",
     "/etc/modules-load.d/tcpfit-bbr.conf",
     "/etc/systemd/system/multi-user.target.wants/tcpfit-qdisc.service",
+    "/etc/ppp/ip-up.d/50-tcpfit",
+    "/usr/local/sbin/tcpfit-initcwnd.sh",
+    "/etc/systemd/system/tcpfit-initcwnd.service",
+    "/etc/systemd/system/multi-user.target.wants/tcpfit-initcwnd.service",
 )
+NETWORKD_DIR = Path("/etc/systemd/network")
+WINDOW_DROPIN = "50-tcpfit-initcwnd.conf"
 
 
 class TaskError(Exception):
@@ -64,6 +70,22 @@ class TaskError(Exception):
 
 class SelectionRequired(TaskError):
     """停止测速，使用已经取得的结果进入配置选择。"""
+
+
+class TrafficBudgetReached(SelectionRequired):
+    """已完成的测速达到预算，不再启动下一次传输。"""
+
+
+def return_route(peer, family):
+    words = command(["ip", "-{}".format(family), "route", "get", peer]).stdout.split()
+    def field(key, default=None):
+        return words[words.index(key) + 1] if key in words and words.index(key) + 1 < len(words) else default
+    iface, table = field("dev"), field("table", "main")
+    if not iface or not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,15}", iface):
+        raise TaskError("无法确定到测速端的实际出口网卡")
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", table):
+        raise TaskError("测速路径的路由表名称无效")
+    return iface, "main" if table == "254" else table
 
 
 def validate_ports(args):
@@ -502,9 +524,22 @@ class QueueState:
 
 class Snapshot:
     @staticmethod
+    def persistence_paths(iface=None):
+        paths = set(CONFIG_FILES)
+        paths.update(str(path) for path in NETWORKD_DIR.glob("*.network.d/" + WINDOW_DROPIN))
+        if iface and shutil.which("networkctl"):
+            status = command(["env", "LC_ALL=C", "networkctl", "status", iface], check=False).stdout
+            match = re.search(r"Network File:\s*(/[^\n]+\.network)\s*$", status, re.MULTILINE)
+            if match:
+                paths.add(str(NETWORKD_DIR / (Path(match.group(1)).name + ".d") / WINDOW_DROPIN))
+        return paths
+
+    @staticmethod
     def capture(iface, keys, state_dir):
         files = {}
-        for name in CONFIG_FILES + (str(Path(state_dir) / "initcwnd.owned"),):
+        paths = Snapshot.persistence_paths(iface)
+        paths.update(str(Path(state_dir) / name) for name in ("initcwnd.owned", "initcwnd.vals", "route-windows.before", "qdisc.iface"))
+        for name in sorted(paths):
             path = Path(name)
             if path.is_symlink():
                 if "multi-user.target.wants" not in name:
@@ -522,9 +557,11 @@ class Snapshot:
                 values[key] = result.stdout.strip()
         return {
             "files": files, "sysctl": values, "queue": QueueState.capture(iface),
-            "routes": {family: command(["ip", family, "route", "show", "default"]).stdout.splitlines() for family in ("-4", "-6")},
+            "routes": {family: command(["ip", family, "route", "show", "table", "all", "default"]).stdout.splitlines() for family in ("-4", "-6")},
             "captured_at": time.time(),
             "service_active": command(["systemctl", "is-active", "tcpfit-qdisc.service"], check=False).stdout.strip() == "active",
+            "window_service_active": command(["systemctl", "is-active", "tcpfit-initcwnd.service"], check=False).stdout.strip() == "active",
+            "dispatcher_active": command(["systemctl", "is-active", "networkd-dispatcher"], check=False).stdout.strip() == "active",
         }
 
     @staticmethod
@@ -556,6 +593,58 @@ class Snapshot:
         return tuple(parts[parts.index(key) + 1] if key in parts else "" for key in ("via", "dev", "metric", "table"))
 
     @staticmethod
+    def route_windows(line):
+        words, values = line.split(), []
+        for key in ("initcwnd", "initrwnd"):
+            if key in words:
+                index = words.index(key) + 1
+                if index >= len(words) or not words[index].isdigit() or not 1 <= int(words[index]) <= 2147483647:
+                    raise TaskError("路由窗口值无效")
+                values.extend((key, words[index]))
+        return values
+
+    @classmethod
+    def route_pairs(cls, state, current_routes):
+        """优先匹配原优先级，唯一出口允许网关/优先级变化；从不重建旧路由。"""
+        iface = state.get("queue", {}).get("iface")
+        scope = state.get("route_scope", {})
+        def identity(line):
+            _, dev, metric, table = cls.route_identity(line)
+            return dev, metric or "0", "main" if table in ("", "254") else table
+        for family, originals in state["routes"].items():
+            if scope and family != scope["family"]:
+                continue
+            for original in originals:
+                dev, metric, table = identity(original)
+                if scope and table != scope["table"]:
+                    continue
+                if not dev or iface and dev != iface:
+                    continue
+                if "nexthop" in original.split():
+                    continue
+                candidates = [line for line in current_routes.get(family, [])
+                              if identity(line)[::2] == (dev, table) and "nexthop" not in line.split()]
+                exact = [line for line in candidates if identity(line)[1] == metric]
+                candidates = exact or candidates
+                # 原来有多条同出口路由时，不能靠唯一剩余的一条猜测丢失路由。
+                old_count = sum(identity(line)[::2] == (dev, table) for line in originals)
+                if len(candidates) != 1 or not exact and old_count != 1:
+                    raise TaskError("当前默认路由已变化，无法唯一对应原出口 {}，未重建旧路由".format(dev))
+                yield family, original, candidates[0]
+
+    @classmethod
+    def verify_route_windows(cls, state, current_routes):
+        for _, original, current in cls.route_pairs(state, current_routes):
+            if cls.route_windows(original) != cls.route_windows(current):
+                raise TaskError("当前路由的 TCP 窗口与所选配置不一致")
+
+    @classmethod
+    def matches_restored(cls, actual, expected):
+        cls.verify_route_windows(expected, actual["routes"])
+        left, right = json.loads(configuration_identity(actual)), json.loads(configuration_identity(expected))
+        return {k: v for k, v in left.items() if k != "routes"} == {k: v for k, v in right.items() if k != "routes"}
+
+    @staticmethod
     def route_config(line):
         # RA 等自动路由的剩余寿命不是配置变化，不能因此反复回写路由。
         return re.sub(r"\s+expires\s+\S+", "", line).split()
@@ -577,6 +666,11 @@ class Snapshot:
     def restore(cls, state):
         failures = []
         command(["systemctl", "stop", "tcpfit-qdisc.service"], check=False)
+        managed = CONFIG_FILES[0] in state["files"]
+        if managed:
+            stopped = command(["systemctl", "stop", "tcpfit-initcwnd.service"], check=False)
+            if stopped.returncode and command(["systemctl", "is-active", "tcpfit-initcwnd.service"], check=False).stdout.strip() == "active":
+                raise TaskError("窗口持久化服务无法停止，不能可靠恢复")
         for key, value in state["sysctl"].items():
             try:
                 command(["sysctl", "-qw", key + "=" + value])
@@ -585,25 +679,46 @@ class Snapshot:
             except TaskError as error:
                 failures.append(str(error))
         try:
-            cls.restore_files(state["files"])
+            files = dict(state["files"])
+            if managed:
+                for path in cls.persistence_paths():
+                    files.setdefault(path, None)
+                for name in state["files"]:
+                    if Path(name).name == "initcwnd.owned":
+                        for basename in ("initcwnd.vals", "route-windows.before", "qdisc.iface"):
+                            files.setdefault(str(Path(name).with_name(basename)), None)
+            cls.restore_files(files)
             command(["systemctl", "daemon-reload"])
             if state["service_active"]:
                 command(["systemctl", "start", "tcpfit-qdisc.service"])
+            if state.get("window_service_active"):
+                command(["systemctl", "start", "tcpfit-initcwnd.service"])
+            if managed and state.get("dispatcher_active") is False:
+                command(["systemctl", "stop", "networkd-dispatcher"], check=False)
         except (TaskError, OSError) as error:
             failures.append(str(error))
-        for family, original in state["routes"].items():
-            current = command(["ip", family, "route", "show", "default"]).stdout.splitlines()
-            if sorted(cls.route_config(line) for line in current) == sorted(cls.route_config(line) for line in original):
-                continue
-            try:
-                for line in original:
-                    command(["ip", family, "route", "replace"] + cls.route_restore_args(line, state.get("captured_at")))
-                identities = {cls.route_identity(line) for line in original}
-                for line in command(["ip", family, "route", "show", "default"]).stdout.splitlines():
-                    if cls.route_identity(line) not in identities:
-                        command(["ip", family, "route", "del"] + cls.route_config(line))
-            except TaskError as error:
-                failures.append(str(error))
+        try:
+            current_routes = {family: command(["ip", family, "route", "show", "table", "all", "default"]).stdout.splitlines()
+                              for family in state["routes"]}
+            pairs = list(cls.route_pairs(state, current_routes))
+            for family, original, current in pairs:
+                if cls.route_windows(original) == cls.route_windows(current):
+                    continue
+                tokens = cls.route_restore_args(current)
+                clean, skip = [], False
+                for token in tokens:
+                    if skip:
+                        skip = False
+                    elif token in ("initcwnd", "initrwnd"):
+                        skip = True
+                    else:
+                        clean.append(token)
+                command(["ip", family, "route", "replace"] + clean + cls.route_windows(original))
+            actual = {family: command(["ip", family, "route", "show", "table", "all", "default"]).stdout.splitlines()
+                      for family in state["routes"]}
+            cls.verify_route_windows(state, actual)
+        except TaskError as error:
+            failures.append(str(error))
         try:
             QueueState.restore(state["queue"])
         except TaskError as error:
@@ -615,6 +730,7 @@ class Snapshot:
 WORKER = r'''
 source "$1"
 shift
+IP_FAMILY="${TCPFIT_ROUTE_FAMILY:--4}"
 LOCK_HELD=1
 WIZARD=1
 ARCH_INCLUDE_SWEEP=0
@@ -639,7 +755,7 @@ buf_max_reason(){
 }
 action="$1"; shift
 case "$action" in
-  profile) printf '%s\n' "$(detect_iface)" "$DEFAULT_RTT" "$VDUR" "$VERIFY_GOOD_PCT" "$VERIFY_ACCEPT_PCT" ;;
+  profile) printf '%s\n' "${TCPFIT_IF:--}" "$DEFAULT_RTT" "$VDUR" "$VERIFY_GOOD_PCT" "$VERIFY_ACCEPT_PCT" ;;
   keys) printf '%s\n' $TUNED_KEYS ;;
   snapshot) take_snapshot ;;
   sample) run_iperf return-path "$2" "$1" ;;
@@ -647,6 +763,12 @@ case "$action" in
   buffer-plan) calc_buffer_profile "$1" "$2" "$3" ;;
   buffers) read_buffer_config ;;
   buffer) apply_buffer_config "$@" ;;
+  persist-windows)
+    iface=$(detect_iface)
+    remember_route_windows "$iface" || exit 1
+    mkdir -p "$STATE_DIR" && printf '%s %s %s\n' "$IP_FAMILY" "${TCPFIT_ROUTE_TABLE:-main}" "$iface" > "$INITCWND_MARKER" || exit 1
+    printf '%s\n' "$*" > "$INITCWND_VALS" || exit 1
+    persist_initcwnd "$iface" "$@" ;;
   fq) qdisc_remove_root "$1" && qdisc_set_fq "$1" ;;
   test-shape) apply_test_shaper "$1" "$2" ;;
   shape) if [ "$1" = off ]; then cmd_shape --off; else cmd_shape --rate "$1"; fi ;;
@@ -666,9 +788,16 @@ class Worker:
         self.script, self.run_dir, self.lock_fd, self.check = Path(script).as_posix(), run_dir, lock_fd, check
         self.stage = "probe"
         self.children_file = Path(run_dir) / "worker.json" if run_dir else None
+        self.iface, self.family, self.route_table = None, 4, "main"
+        self.route_peer = None
 
     def run(self, action, *args, quiet=False, allow_failure=False):
+        if self.route_peer and action in ("sample", "tune", "buffer", "fq", "shape", "test-shape"):
+            if return_route(self.route_peer, self.family) != (self.iface, self.route_table):
+                raise SelectionRequired("到测速端的出口已改变，停止本次测速")
         env = dict(os.environ, TCPFIT_NO_TELEMETRY="1")
+        if self.iface:
+            env.update(TCPFIT_IF=self.iface, TCPFIT_ROUTE_FAMILY=str(-self.family), TCPFIT_ROUTE_TABLE=self.route_table)
         if self.run_dir:
             env.update(TCPFIT_RETURN_RUN=str(self.run_dir), TCPFIT_RETURN_HELPER=str(Path(__file__).resolve()), TCPFIT_RETURN_STAGE=self.stage)
         process = subprocess.Popen(
@@ -1828,11 +1957,12 @@ def queue_parameters(queue):
 class MeasurementBook:
     """每次测量关联完整快照；失败和计划中未执行的测量也保留序号。"""
 
-    def __init__(self, worker, coordinator, record_dir, capture, repeats, duration):
+    def __init__(self, worker, coordinator, record_dir, capture, repeats, duration, traffic_limit_gb=None):
         self.worker, self.coordinator = worker, coordinator
         self.record_dir, self.capture = Path(record_dir), capture
         self.repeats, self.duration = repeats, duration
         self.records, self.configurations, self.identities = [], {}, {}
+        self.traffic_limit_gb = traffic_limit_gb
         (self.record_dir / "configurations").mkdir(exist_ok=True)
 
     def register(self, snapshot=None):
@@ -1848,6 +1978,18 @@ class MeasurementBook:
 
     def save(self):
         atomic_json(self.record_dir / "measurement-index.json", self.records)
+        atomic_json(self.record_dir / "traffic.json", self.traffic_summary())
+
+    def traffic_summary(self):
+        sent = sum(row.get("sender_bytes", 0) for row in self.records if row["status"] == "valid")
+        received = sum(row.get("receiver_bytes", 0) for row in self.records if row["status"] == "valid")
+        return {"sender_bytes": sent, "receiver_bytes": received,
+                "limit_gb": self.traffic_limit_gb, "limit_reached": bool(self.traffic_limit_gb and sent >= self.traffic_limit_gb * 10**9),
+                "incomplete": any(row["status"] == "failed" for row in self.records)}
+
+    def check_traffic_budget(self):
+        if self.traffic_summary()["limit_reached"]:
+            raise TrafficBudgetReached("已达到 {} GB 测速流量预算，停止后续测速".format(self.traffic_limit_gb))
 
     def measure_group(self, stage, modes=(1,), repeats=None):
         repeats = self.repeats if repeats is None else repeats
@@ -1865,6 +2007,7 @@ class MeasurementBook:
         try:
             for row in rows:
                 self.coordinator.check()
+                self.check_traffic_budget()
                 row["status"] = "measuring"
                 self.save()
                 self.worker.stage = "{} 第 {}/{} 次".format(stage, row["sample"], repeats)
@@ -1892,6 +2035,8 @@ class MeasurementBook:
                             row["decision"] = band
             self.save()
             log(stage + "完成：" + describe_measurements(rows))
+            log("累计测速数据：发送 {:.2f} GB，接收 {:.2f} GB".format(
+                self.traffic_summary()["sender_bytes"] / 10**9, self.traffic_summary()["receiver_bytes"] / 10**9))
             return rows
         except BaseException as error:
             reason = str(error) or error.__class__.__name__
@@ -1902,7 +2047,7 @@ class MeasurementBook:
                     if active:
                         row["id"] = active["id"]
                 elif row["status"] == "pending":
-                    row.update(status="skipped", decision="跳过：前序测量失败或任务中断")
+                    row.update(status="skipped", decision="跳过：" + reason)
                 elif row["status"] == "valid":
                     row["decision"] = "本次有效，整组未完成验证"
             self.save()
@@ -2216,6 +2361,9 @@ def validate_environment(args):
     if isinstance(args.repeats, bool) or not isinstance(args.repeats, int) or not 1 <= args.repeats <= 10:
         raise TaskError("测速次数必须是 1-10 的整数")
     reference_bandwidth(args.server_bw, args.client_bw)
+    budget = getattr(args, "traffic_limit_gb", None)
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= 1000000):
+        raise TaskError("流量预算必须是 1-1000000 GB 的整数")
     family = socket.AF_INET if args.family == 4 else socket.AF_INET6
     try:
         addresses = socket.getaddrinfo(args.server, args.control_port, family, socket.SOCK_STREAM)
@@ -2241,6 +2389,10 @@ def print_report(result):
     print("  最终缓冲区：" + describe_buffers(result["buffers_final"]))
     print("  判定：" + result["selected_validation"])
     print("  当前限速：" + result["rate_limits_final"])
+    traffic = result.get("traffic", {})
+    print("  测速数据：发送 {:.2f} GB，接收 {:.2f} GB{}".format(
+        traffic.get("sender_bytes", 0) / 10**9, traffic.get("receiver_bytes", 0) / 10**9,
+        "（部分失败传输未计入）" if traffic.get("incomplete") else ""))
     print("  试调 {} 轮；停止原因：{}".format(
         len(result.get("buffer_trials", [])), result.get("buffer_search", {}).get("stop_reason", "测速提前停止")))
     print("  记录：" + result["record_dir"], flush=True)
@@ -2272,6 +2424,19 @@ def persist_selected_configuration(worker, snapshot):
     elif not queue.get("limited_fq") and all(item["kind"] == "fq" for item in queue.get("qdiscs", [])):
         worker.run("shape", "off")
 
+
+def persist_selected_windows(worker, snapshot):
+    # 实际参数相同的旧配置也可能使用旧钩子，保存时更新其持久化方式。
+    if not snapshot.get("route_scope"):
+        return False
+    pairs = list(Snapshot.route_pairs(snapshot, snapshot["routes"]))
+    if len(pairs) == 1:
+        windows = Snapshot.route_windows(pairs[0][1])
+        if windows:
+            worker.run("persist-windows", *windows)
+            return True
+    return False
+
 def save_configuration_choice(book, worker, result, recommendation, automatic, check):
     """正常完成和提前停止共用同一套选择、完整恢复与保存检查。"""
     minimum = result["buffer_plan"]["min_bytes"]
@@ -2302,7 +2467,7 @@ def save_configuration_choice(book, worker, result, recommendation, automatic, c
         # 原配置可低于试调下限；完整恢复原文件，不重新生成持久化配置。
         Snapshot.restore(selected_state)
         final_state = book.capture()
-        if configuration_identity(final_state) != configuration_identity(selected_state):
+        if not Snapshot.matches_restored(final_state, selected_state):
             raise TaskError("恢复后的配置与调优前快照不一致")
         result.update(selected_config=selected, selected_number=0, selection="manual",
                       selected_validation="不修改，已恢复调优前配置", base_kept=False,
@@ -2321,11 +2486,14 @@ def save_configuration_choice(book, worker, result, recommendation, automatic, c
         Snapshot.restore(selected_state)
         persist_selected_configuration(worker, selected_state)
         final_state = book.capture()
+    if persist_selected_windows(worker, selected_state):
+        final_state = book.capture()
     if any(final_state["sysctl"].get(key, "").split() != value.split()
            for key, value in selected_state["sysctl"].items()):
         raise TaskError("所选配置的实际参数与测速快照不一致")
     if queue_parameters(final_state["queue"]) != queue_parameters(selected_state["queue"]):
         raise TaskError("所选配置的实际整形与测速快照不一致")
+    Snapshot.verify_route_windows(selected_state, final_state["routes"])
     buffers = buffers_from_sysctl(final_state["sysctl"])
     if not buffer_floor_met(buffers, minimum):
         raise TaskError("最终缓冲区低于 BDP÷2，不能保存")
@@ -2415,8 +2583,6 @@ def run_prepared_task(args, reservations):
         profile = worker.run("profile", quiet=True)[0].splitlines()
         iface, default_rtt, duration, good_pct, accept_pct = profile
         keys = worker.run("keys", quiet=True)[0].splitlines()
-        # 配对之前先确认队列可恢复，避免让家宽接入后才发现不支持。
-        QueueState.capture(iface)
         firewall.setup()
         result["firewall"] = {"backend": firewall.state["backend"], "manager": firewall.state["manager"],
                               "source_ip_restricted": firewall.state["backend"] != "none"}
@@ -2427,10 +2593,18 @@ def run_prepared_task(args, reservations):
         while not coordinator.paired.wait(0.5):
             coordinator.check()
         coordinator.check()
-        route = command(["ip", "-{}".format(args.family), "route", "get", coordinator.peer]).stdout.split()
-        if "dev" not in route or route[route.index("dev") + 1] != iface:
-            raise TaskError("到测速端的路由未使用默认出口网卡，无法套用原版调优，未修改网络参数")
-        before_state = Snapshot.capture(iface, keys, args.state_dir)
+        iface, route_table = return_route(coordinator.peer, args.family)
+        worker.iface, worker.family, worker.route_table = iface, args.family, route_table
+        worker.route_peer = coordinator.peer
+        result.update(iface=iface, route_table=route_table, family=args.family)
+        log("回国路径出口：{}，IPv{}，路由表 {}".format(iface, args.family, route_table))
+        def capture_state():
+            captured = Snapshot.capture(iface, keys, args.state_dir)
+            captured["route_scope"] = {"family": "-{}".format(args.family), "table": route_table}
+            return captured
+
+        # 配对后才知道真实出口；任何网络参数变更前先检查它的队列能否恢复。
+        before_state = capture_state()
         result["buffers_before"] = buffers_from_sysctl(before_state["sysctl"])
         atomic_json(record_dir / "before.json", before_state)
         worker.run("snapshot")
@@ -2445,7 +2619,8 @@ def run_prepared_task(args, reservations):
             command(["systemctl", "stop", "tcpfit-qdisc.service"])
         worker.run("fq", iface)
         book = MeasurementBook(worker, coordinator, record_dir,
-                               lambda: Snapshot.capture(iface, keys, args.state_dir), args.repeats, int(duration))
+                               lambda: capture_state(), args.repeats, int(duration),
+                               getattr(args, "traffic_limit_gb", None))
         original_config = book.register(before_state)
         result.update(measurements=book.records, repeats=args.repeats, original_config=original_config)
         measure_group = book.measure_group
@@ -2549,7 +2724,7 @@ def run_prepared_task(args, reservations):
         result["final_confirmation_reasons"] = confirmation_reasons
         if confirmation_reasons:
             log("最终配置需复测确认：" + "；".join(confirmation_reasons))
-        current_state = Snapshot.capture(iface, keys, args.state_dir)
+        current_state = capture_state()
         measured_state = book.configurations[result["after"][0]["config_id"]]
         if kept and not confirmation_reasons and configuration_parameters(current_state) == configuration_parameters(measured_state):
             result["final"] = result["after"]
@@ -2583,7 +2758,7 @@ def run_prepared_task(args, reservations):
             result["shape_reason"] = "最终验收未通过，恢复原配置和原整形"
             result["final"] = measure_group("最终验收未通过，恢复原配置复测")
             kept = False
-        final_state = Snapshot.capture(iface, keys, args.state_dir)
+        final_state = capture_state()
         expected_buffers = result["buffers_selected"] if kept else result["buffers_before"]
         if buffers_from_sysctl(final_state["sysctl"]) != expected_buffers:
             raise TaskError("最终实际缓冲区值与已验证配置不一致")
@@ -2613,6 +2788,8 @@ def run_prepared_task(args, reservations):
         success = True
     except BaseException as error:
         reason = str(error) or error.__class__.__name__
+        if isinstance(error, TrafficBudgetReached):
+            result.setdefault("buffer_search", {})["stop_reason"] = reason
         can_select = (not selection_state["active"] and not selection_state["cancelled"] and
                       (selection_state["requested"] or isinstance(error, (SelectionRequired, KeyboardInterrupt)) or
                        book is not None and any(row["status"] == "failed" for row in book.records)))
@@ -2645,6 +2822,21 @@ def run_prepared_task(args, reservations):
                 success = True
             except BaseException as selection_error:
                 reason = str(selection_error) or selection_error.__class__.__name__
+        elif isinstance(error, TrafficBudgetReached) and before_state is not None:
+            try:
+                Snapshot.restore(before_state)
+                final_state = capture_state()
+                if not Snapshot.matches_restored(final_state, before_state):
+                    raise TaskError("预算耗尽后未完整恢复原配置")
+                atomic_json(record_dir / "final.json", final_state)
+                result.update(selected_number=0, recommended_number=0, selected_config=result["original_config"],
+                              selected_validation="预算耗尽，尚无可保存的调优结果，已恢复原配置",
+                              testing_complete=False, selection_reason=reason, status="completed", base_kept=False,
+                              buffers_final=buffers_from_sysctl(final_state["sysctl"]), final_rate=final_state["queue"]["rate"],
+                              rate_limits_final=describe_rate_limits(final_state["queue"]))
+                success = True
+            except (TaskError, OSError) as restore_error:
+                reason = str(restore_error)
         elif can_select:
             log("尚无符合缓冲区下限的有效测速结果，恢复任务前配置")
         if not success:
@@ -2670,7 +2862,7 @@ def run_prepared_task(args, reservations):
         if not success and journal["dirty"] and before_state:
             try:
                 Snapshot.restore(before_state)
-                restored_state = Snapshot.capture(iface, keys, args.state_dir)
+                restored_state = capture_state()
                 restored_buffers = buffers_from_sysctl(restored_state["sysctl"])
                 if restored_buffers != result["buffers_before"]:
                     raise TaskError("快照恢复后的实际缓冲区与调优前不一致")
@@ -2695,6 +2887,7 @@ def run_prepared_task(args, reservations):
         atomic_json(journal_path, journal)
         if book is not None:
             book.save()
+            result["traffic"] = book.traffic_summary()
         atomic_json(record_dir / "result.json", result)
         if journal["done"]:
             guardian.wait(timeout=5)
@@ -2728,6 +2921,7 @@ def main():
     run.add_argument("--yes", action="store_true")
     run.add_argument("--server-bw", type=int)
     run.add_argument("--client-bw", type=int)
+    run.add_argument("--traffic-limit-gb", type=int, help="可选测速数据预算，单位 GB；逐次测速后检查")
     run.add_argument("--state-dir", default="/var/lib/tcpfit")
     run.add_argument("--lock-fd", type=int)
     measure = sub.add_parser("measure")

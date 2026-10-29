@@ -48,6 +48,16 @@ def run_shell(code, *args, env=None):
 
 
 class ReturnEntryTests(unittest.TestCase):
+    def test_traffic_budget_is_optional_validated_and_passed_to_worker(self):
+        result = self.run_return("--yes", "--traffic-limit-gb", "50")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("<--traffic-limit-gb> <50>", result.stdout)
+        for value in ("0", "-1", "1.5", "abc", "1000001"):
+            with self.subTest(value=value):
+                result = self.run_return("--yes", "--traffic-limit-gb", value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("DEPENDENCIES", result.stdout)
+
     def run_return(self, *args, route="1.1.1.1 dev eth0 src 8.8.8.8 uid 0", ipify="", fallback="",
                    manual="", ipify_status=0, fallback_status=0, extra="", bandwidth=1000):
         env = dict(os.environ, TCPFIT_TEST_ROUTE=route, TCPFIT_TEST_IPIFY=ipify, TCPFIT_TEST_FALLBACK=fallback,

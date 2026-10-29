@@ -36,7 +36,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.22.2"
+VERSION="0.23.0"
 REPO="P0me1oo/tcpfit-x"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 STATE_DIR="/var/lib/tcpfit"
@@ -46,6 +46,12 @@ QDISC_UNIT="/etc/systemd/system/tcpfit-qdisc.service"
 ROUTE_HOOK="/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd"
 BBR_MODULE_FILE="/etc/modules-load.d/tcpfit-bbr.conf"
 INITCWND_MARKER="$STATE_DIR/initcwnd.owned"
+INITCWND_VALS="$STATE_DIR/initcwnd.vals"
+PPP_HOOK="/etc/ppp/ip-up.d/50-tcpfit"
+INITCWND_UNIT="/etc/systemd/system/tcpfit-initcwnd.service"
+INITCWND_SCRIPT="/usr/local/sbin/tcpfit-initcwnd.sh"
+NETWORKD_DIR="/etc/systemd/network"
+INITCWND_DROPIN_NAME="50-tcpfit-initcwnd.conf"
 SNAPSHOT="$STATE_DIR/pre-tune.snapshot"
 FACTS="$STATE_DIR/facts"
 
@@ -369,31 +375,105 @@ migrate_legacy(){
 }
 
 # ── 环境检测 ────────────────────────────────────────────────────────────────
-# 默认路由网卡. 【不跟 $IP_FAMILY 走】—— 网卡是物理概念, 整形和 qdisc 打在同一张卡上,
-# 选 v4 还是 v6 测速都是它. 只是纯 v6 机器的 v4 路由表是空的, 所以 v4 查不到时回退查 v6.
-# (`ip route` 等价于 `ip -4 route`, 早期版本只写这一句, 纯 v6 机器直接
-#  die "找不到默认路由网卡", 从来就没跑起来过.)
+# 回国模式固定已配对路径的出口，普通模式按所选协议族找默认网卡。
+# 按字段名读取路由，兼容没有 via 的点对点链路。
+route_field(){
+  local key="$1" line="${2-}"
+  [ $# -ge 2 ] || line=$(ip "${IP_FAMILY:--4}" route show default 2>/dev/null | head -1)
+  awk -v k="$key" '{for(i=1;i<NF;i++) if($i==k){print $(i+1); exit}}' <<< "$line"
+}
+
 detect_iface(){
   local i
-  i=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
-  [ -n "$i" ] || i=$(ip -6 route show default 2>/dev/null | awk '{print $5; exit}')
+  if [ -n "${TCPFIT_IF:-}" ]; then printf '%s\n' "$TCPFIT_IF"; return; fi
+  i=$(route_field dev "$(ip "${IP_FAMILY:--4}" route show default 2>/dev/null | head -1)")
+  [ -n "$i" ] || i=$(route_field dev "$(ip -6 route show default 2>/dev/null | head -1)")
+  [ -n "$i" ] || i=$(route_field dev "$(ip -4 route show default 2>/dev/null | head -1)")
   echo "$i"
 }
-# 网关【只取 v4】. 它唯一的用途是 `ip route replace default via $gw ...`(设 initcwnd),
-# 那是 IPv4 路由表操作, 喂 v6 地址进去会直接报
-# "Error: inet address is expected rather than 2a0f:...". 实测验证过.
-# 纯 v6 机器上这里返回空, 调用方的 [ -n "$gw" ] 会跳过 initcwnd —— 安全降级.
-detect_gw(){    ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
+detect_gw(){ route_field via; }
+
+# 仅处理指定网卡及路由表；沿用当前网关、优先级和协议属性。
+route_for_iface(){
+  local routes
+  routes=$(ip "${IP_FAMILY:--4}" route show table "${TCPFIT_ROUTE_TABLE:-main}" default 2>/dev/null) || return 1
+  awk -v d="$1" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; break}}' <<< "$routes"
+}
+route_restore_windows(){
+  local iface="$1" line token skip expires=0 actual; shift
+  local -a args clean
+  line=$(route_for_iface "$iface")
+  [ -n "$line" ] || { [ $# = 0 ]; return; }
+  # 多条候选无法确定对应关系时停止，不能把一份窗口值套到所有出口。
+  [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] || return 1
+  case " $line " in *' nexthop '*) return 1 ;; esac
+  args=(); clean=(); skip=0
+  read -r -a args <<< "$line"
+  for token in "${args[@]}"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    if [ "$expires" = 1 ]; then clean+=("${token%sec}"); expires=0; continue; fi
+    case "$token" in initcwnd|initrwnd|table) skip=1 ;; expires) clean+=("$token"); expires=1 ;; *) clean+=("$token") ;; esac
+  done
+  ip "${IP_FAMILY:--4}" route replace table "${TCPFIT_ROUTE_TABLE:-main}" "${clean[@]}" "$@" || return 1
+  actual=$(route_for_iface "$iface" | awk '{for(i=1;i<NF;i++) if($i=="initcwnd"||$i=="initrwnd") {printf "%s%s %s",s,$i,$(i+1);s=" "}}')
+  [ "$actual" = "$*" ]
+}
+route_set_initcwnd(){ route_restore_windows "$(detect_iface)" initcwnd "$1" initrwnd "$1"; }
+
+# 老版出厂快照只保存 IPv4 主表；另记每个实际调整出口的原窗口供回滚/卸载使用。
+remember_route_windows(){
+  local iface="$1" line key file="$STATE_DIR/route-windows.before" tmp windows original
+  line=$(route_for_iface "$iface") || return 1
+  [ -n "$line" ] && [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] || return 0
+  case " $line " in *' nexthop '*) return 0 ;; esac
+  key=$(printf '%s\t%s\t%s\t' "${IP_FAMILY:--4}" "${TCPFIT_ROUTE_TABLE:-main}" "$iface")
+  if [ -f "$file" ] && grep -Fq -- "$key" "$file"; then return 0; fi
+  # 升级前已经调过的 IPv4 主表，沿用原出厂快照，不能把当前 32 当作出厂值。
+  if [ "${IP_FAMILY:--4}" = -4 ] && [ "${TCPFIT_ROUTE_TABLE:-main}" = main ] && [ -f "$SNAPSHOT" ]; then
+    original=$(awk '/^# route: /{sub(/^# route: /, "");print;exit}' "$SNAPSHOT")
+    if [ "$(route_field dev "$original")" = "$iface" ]; then line="$original"; fi
+  fi
+  windows=$(awk '{for(i=1;i<NF;i++) if($i=="initcwnd"||$i=="initrwnd") {printf "%s%s %s",s,$i,$(i+1);s=" "}}' <<< "$line")
+  mkdir -p "$STATE_DIR" || return 1
+  tmp=$(mktemp "$STATE_DIR/.route-windows.XXXXXX") || return 1
+  { { [ ! -f "$file" ] || cat "$file"; } && printf '%s%s\n' "$key" "$windows"; } > "$tmp" &&
+    chmod 600 "$tmp" && mv -- "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+restore_window_baselines(){
+  local file="$STATE_DIR/route-windows.before" family table iface values failed=0
+  local IP_FAMILY TCPFIT_ROUTE_TABLE
+  local -a windows
+  [ -f "$file" ] || return 0
+  while IFS=$'\t' read -r family table iface values; do
+    case "$family" in -4|-6) ;; *) return 1 ;; esac
+    [ -n "$table" ] && [ -n "$iface" ] || return 1
+    IP_FAMILY="$family"; TCPFIT_ROUTE_TABLE="$table"
+    windows=(); read -r -a windows <<< "$values"
+    route_restore_windows "$iface" "${windows[@]}" || failed=1
+  done < "$file"
+  [ "$failed" = 0 ] || return 1
+  rm -f "$file"
+}
 
 # 只清理 tcpfit 自己写入的 initcwnd/initrwnd. 旧版本没有 ownership marker,
 # 所以兼容两种证据: tcpfit 的持久化 hook, 或快照明确显示调优前没有这两个属性.
 # 重建路由时沿用 `ip route show` 的全部 token, 只剔除窗口字段，避免丢掉
 # metric/proto/src/onlink 等服务商下发的属性.
 clear_owned_initcwnd(){
-  local route routes before owned=0 skip=0 token
+  local route routes before owned=0 skip=0 token owner_family owner_table owner_iface iface
   local -a args clean
   INITCWND_CLEARED=0
-  routes=$(ip -4 route show default 2>/dev/null)
+  iface=$(detect_iface)
+  if [ -s "$INITCWND_MARKER" ]; then
+    read -r owner_family owner_table owner_iface < "$INITCWND_MARKER"
+    [ "$owner_family $owner_table $owner_iface" = "${IP_FAMILY:--4} ${TCPFIT_ROUTE_TABLE:-main} $iface" ] || return 0
+  elif [ -f "$INITCWND_MARKER" ] && [ -f "$SNAPSHOT" ]; then
+    before=$(awk '/^# route: /{sub(/^# route: /, "");print;exit}' "$SNAPSHOT")
+    owner_iface=$(route_field dev "$before")
+    [ -z "$owner_iface" ] || [ "$owner_iface" = "$iface" ] || return 0
+  fi
+  routes=$(route_for_iface "$(detect_iface)")
   route=${routes%%$'\n'*}
 
   [ -f "$INITCWND_MARKER" ] && owned=1
@@ -409,8 +489,12 @@ clear_owned_initcwnd(){
   [ "$owned" = 1 ] || return 0
   INITCWND_CLEARED=1
 
+  remember_route_windows "$(detect_iface)" || return 1
+
   # 先移除持久化入口；即使运行时路由暂时改不了，重连/重启后也不会再写回 32.
-  rm -f "$ROUTE_HOOK" "$INITCWND_MARKER"
+  remove_initcwnd_persistence || return 1
+  rm -f "$INITCWND_MARKER" "$INITCWND_VALS" || return 1
+  [ -x "$QDISC_SCRIPT" ] || rm -f "$PPP_HOOK"
   if ! has_str "$route" ' initcwnd ' && ! has_str "$route" ' initrwnd '; then
     return 0
   fi
@@ -424,7 +508,7 @@ clear_owned_initcwnd(){
     esac
   done
   [ "${#clean[@]}" -gt 0 ] || return 1
-  ip -4 route replace "${clean[@]}" 2>/dev/null
+  route_restore_windows "$(detect_iface)"
 }
 
 # 算 BDP 用的 RTT. 固定 150ms, 不再探测.  用 --rtt 可以覆盖.
@@ -1273,48 +1357,31 @@ archive_find(){
 
 # 恢复即时路由，并让 hook 只重放存档中的窗口值；网关/地址沿用启动时的路由。
 archive_restore_route(){
-  local route="$1" token skip=0 tmp
+  local route="$1" token skip=0 iface
   local -a args=() windows=()
-  rm -f "$ROUTE_HOOK" "$INITCWND_MARKER" || return 1
-  [ -n "$route" ] || return 0
   read -r -a args <<< "$route"
   for token in "${args[@]}"; do
     if [ "$skip" = 1 ]; then
-      case "$token" in ''|*[!0-9]*) warn "存档中的路由窗口无效"; return 1 ;; esac
+      is_posint "$token" 1 2147483647 || return 1
       windows+=("$token"); skip=0
     else
       case "$token" in initcwnd|initrwnd) windows+=("$token"); skip=1 ;; esac
     fi
   done
   [ "$skip" = 0 ] || return 1
-  ip -4 route replace "${args[@]}" 2>/dev/null || { warn "默认路由还原失败"; return 1; }
+  iface=$(route_field dev "$route")
+  [ -n "$iface" ] || iface=$(detect_iface)
+  route_restore_windows "$iface" "${windows[@]}" || { warn "当前路由的窗口还原失败"; return 1; }
+  remove_initcwnd_persistence || return 1
+  rm -f "$INITCWND_MARKER" "$INITCWND_VALS" || return 1
   if [ "${#windows[@]}" -gt 0 ]; then
-    if [ ! -d "$(dirname "$ROUTE_HOOK")" ]; then
-      warn "路由已即时还原，但缺少 networkd-dispatcher hook 目录，无法持久化窗口值"
-      return 1
-    fi
-    tmp=$(mktemp "${ROUTE_HOOK}.restore.XXXXXX") || return 1
-    {
-      printf '#!/bin/bash\nwindows=('
-      printf ' %q' "${windows[@]}"
-      printf ' )\n'
-      cat <<'H'
-routes=$(ip -4 route show default)
-route=${routes%%$'\n'*}
-[ -n "$route" ] || exit 0
-read -r -a args <<< "$route"
-clean=(); skip=0
-for token in "${args[@]}"; do
-  if [ "$skip" = 1 ]; then skip=0; continue; fi
-  case "$token" in initcwnd|initrwnd) skip=1 ;; *) clean+=("$token") ;; esac
-done
-ip -4 route replace "${clean[@]}" "${windows[@]}"
-H
-    } > "$tmp" || { rm -f "$tmp"; return 1; }
-    chmod 755 "$tmp" && mv -- "$tmp" "$ROUTE_HOOK" || { rm -f "$tmp"; return 1; }
-    mkdir -p "$STATE_DIR" && : > "$INITCWND_MARKER" || return 1
+    mkdir -p "$STATE_DIR" && printf '%s %s %s\n' "${IP_FAMILY:--4}" "${TCPFIT_ROUTE_TABLE:-main}" "$iface" > "$INITCWND_MARKER" || return 1
+    printf '%s\n' "${windows[*]}" > "$INITCWND_VALS" || return 1
+    persist_initcwnd "$iface" "${windows[@]}" || return 1
+  elif [ ! -x "$QDISC_SCRIPT" ]; then
+    rm -f "$PPP_HOOK" || return 1
   fi
-  ok "默认路由已还原，窗口持久化已同步"
+  ok "当前路由的窗口已还原，持久化已同步"
 }
 
 archive_restore(){
@@ -1521,6 +1588,9 @@ cmd_rollback(){
   take_lock
   migrate_legacy
   local purge_swap=0 failed=0 k v route
+  local had_window_baselines=0 saved_shape_iface=""
+  [ ! -f "$STATE_DIR/route-windows.before" ] || had_window_baselines=1
+  [ ! -f "$STATE_DIR/qdisc.iface" ] || read -r saved_shape_iface < "$STATE_DIR/qdisc.iface"
   while [ $# -gt 0 ]; do
     case "$1" in
       --purge-swap) purge_swap=1; shift ;;
@@ -1534,7 +1604,8 @@ cmd_rollback(){
   was_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   was_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
   was_rate=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
-  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$INITCWND_MARKER" "$BBR_MODULE_FILE" || {
+  remove_initcwnd_persistence || failed=1
+  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$INITCWND_MARKER" "$INITCWND_VALS" "$PPP_HOOK" "$BBR_MODULE_FILE" || {
     warn "调优配置未完全删除，请检查文件权限或只读文件系统"; failed=1;
   }
   local service_stopped=1
@@ -1548,7 +1619,7 @@ cmd_rollback(){
     rm -f "$QDISC_UNIT" "$QDISC_SCRIPT" || { warn "整形服务文件未完全删除"; failed=1; }
   fi
   systemctl daemon-reload >/dev/null 2>&1 || { warn "systemd 配置重载失败"; failed=1; }
-  local iface; iface=$(detect_iface)
+  local iface; iface=${saved_shape_iface:-$(detect_iface)}
   # 逐项写回快照值
   if [ -f "$SNAPSHOT" ]; then
     while IFS='=' read -r k v; do
@@ -1558,10 +1629,19 @@ cmd_rollback(){
     done < <(grep -E '^(net|vm|fs)\.' "$SNAPSHOT")
     [ "$failed" = 0 ] && ok "已按快照还原 sysctl"
     route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT")
-    if [ -n "$route" ]; then
+    if [ "$had_window_baselines" = 1 ]; then
+      restore_window_baselines || { warn "部分出口的路由窗口未恢复，保留记录供重试"; failed=1; }
+    elif [ -n "$route" ]; then
       local -a route_args=()
       read -r -a route_args <<< "$route"
-      ip -4 route replace "${route_args[@]}" 2>/dev/null || { warn "默认路由还原失败"; failed=1; }
+      local -a window_args=()
+      local token skip=0 original_iface
+      for token in "${route_args[@]}"; do
+        if [ "$skip" = 1 ]; then window_args+=("$token"); skip=0
+        else case "$token" in initcwnd|initrwnd) window_args+=("$token"); skip=1 ;; esac; fi
+      done
+      original_iface=$(route_field dev "$route")
+      route_restore_windows "${original_iface:-$iface}" "${window_args[@]}" || { warn "路由窗口还原失败"; failed=1; }
     fi
   else
     warn "找不到快照, 仅移除了调优文件；重启后内核默认值生效"
@@ -1573,6 +1653,7 @@ cmd_rollback(){
       warn "整形移除失败"; failed=1
     fi
   fi
+  [ "$failed" != 0 ] || rm -f "$STATE_DIR/qdisc.iface"
   # swap 默认不动 —— 删掉一个正在用的 swap 可能让机器立刻 OOM.
   # 想连 swap 一起撤销要显式加 --purge-swap.
   if [ "$purge_swap" = 1 ]; then
@@ -1765,24 +1846,20 @@ EOF
   fi
 
   if [ "$no_initcwnd" = 0 ]; then
-    local gw; gw=$(detect_gw)
-    if [ -n "$gw" ]; then
-      if ip route replace default via "$gw" dev "$iface" initcwnd 32 initrwnd 32 2>/dev/null; then
-        mkdir -p "$STATE_DIR"; : > "$INITCWND_MARKER"
-        ok "initcwnd/initrwnd = 32"
+    remember_route_windows "$iface" || { warn "无法保存原路由窗口，未调整窗口"; return 1; }
+    if route_set_initcwnd 32; then
+      mkdir -p "$STATE_DIR" && printf '%s %s %s\n' "${IP_FAMILY:--4}" "${TCPFIT_ROUTE_TABLE:-main}" "$iface" > "$INITCWND_MARKER" || return 1
+      printf 'initcwnd 32 initrwnd 32\n' > "$INITCWND_VALS" || return 1
+      ok "initcwnd/initrwnd = 32"
+      if persist_initcwnd "$iface" initcwnd 32 initrwnd 32; then
+        info "路由窗口持久化: $INITCWND_VIA"
+        case "$INITCWND_VIA" in systemd-networkd*) networkd_pending_note ;; esac
       else
-        warn "initcwnd not applied (unsupported on some hypervisors)"
+        warn "路由窗口持久化失败，未完成调优"
+        return 1
       fi
-      if [ -d /etc/networkd-dispatcher/routable.d ]; then
-        cat > "$ROUTE_HOOK" <<'H'
-#!/bin/bash
-GW=$(ip route show default | awk '{print $3; exit}')
-IF=$(ip route show default | awk '{print $5; exit}')
-[ -n "$GW" ] && [ -n "$IF" ] && ip route replace default via "$GW" dev "$IF" initcwnd 32 initrwnd 32
-exit 0
-H
-        chmod +x "$ROUTE_HOOK"
-      fi
+    else
+      warn "当前出口没有唯一可调整的默认路由，保留路由窗口"
     fi
   elif clear_owned_initcwnd; then
     [ "${INITCWND_CLEARED:-0}" = 1 ] && ok "Low-bandwidth path: tcpfit initcwnd override removed"
@@ -1970,14 +2047,275 @@ qdisc_set_fq(){   # qdisc_set_fq <iface>
   qdisc_is_fq "$iface"
 }
 
+iface_is_ppp(){ [ "$(cat "/sys/class/net/$1/type" 2>/dev/null)" = 512 ]; }
+
+# 开机把路由窗口写回去. 给"有 systemd 但网不归 systemd-networkd 管"的机器用
+# (ifupdown / NetworkManager). 用单元的代价: 它只在开机跑一次, 中途换 IP/重连
+# 不会跟上 —— 所以排在 PPP 钩子和 networkd 两条路之后, 只是兜底(见 persist_initcwnd).
+write_initcwnd_unit(){   # write_initcwnd_unit <网卡名> [窗口 token...]
+  local iface="$1"; shift
+  local -a win=("$@")
+  if [ "${#win[@]}" = 0 ] && [ -s "$INITCWND_VALS" ]; then
+    read -r -a win < "$INITCWND_VALS"
+  fi
+  [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -d "$(dirname "$INITCWND_UNIT")" ] || return 1
+  mkdir -p "$(dirname "$INITCWND_SCRIPT")" 2>/dev/null || return 1
+  {
+    printf '#!/bin/sh\nIP_FAMILY=%s\nTCPFIT_ROUTE_TABLE=%s\n' "${IP_FAMILY:--4}" "${TCPFIT_ROUTE_TABLE:-main}"
+    printf '# tcpfit: 开机写回路由窗口. 沿用现有路由的全部 token, 只换窗口字段 ——\n'
+    printf '# 自己拼 `via X dev Y` 会丢掉 onlink / metric / proto / src.
+# 实例: 一台香港机器的路由是 `default via 192.168.146.1 dev eth0 onlink`
+# —— 服务商 cloud-init 下发的, 拼不出来.\n'
+    printf 'R=$(ip ${IP_FAMILY:--4} route show table ${TCPFIT_ROUTE_TABLE:-main} default 2>/dev/null |\n'
+    printf '    awk -v d=%s \x27{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}\x27)\n' \
+           "$(printf '%q' "$iface")"
+    printf '[ -n "$R" ] || exit 0\n'
+    cat <<'IH'
+C=$(printf '%s' "$R" | awk '{o="";for(i=1;i<=NF;i++){if($i=="initcwnd"||$i=="initrwnd"||$i=="table"){i++;continue};if($i=="expires"){sub(/sec$/,"",$(i+1))};o=o" "$i};print o}')
+IH
+    printf '[ -n "$C" ] && exec ip ${IP_FAMILY:--4} route replace table ${TCPFIT_ROUTE_TABLE:-main} $C%s 2>/dev/null\n' "$(printf ' %s' "${win[@]}")"
+    printf 'exit 0\n'
+  } > "$INITCWND_SCRIPT" || return 1
+  chmod 755 "$INITCWND_SCRIPT" || return 1
+  cat > "$INITCWND_UNIT" <<EOF || return 1
+[Unit]
+Description=tcpfit initcwnd/initrwnd on the default route
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$INITCWND_SCRIPT
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  # 写出来不等于会开机跑 —— 必须 enable 成功才算持久化.
+  # 但要把"写不出去"和"写了 systemd 不收"分开说: 后者文件还在, 用户可以手动
+  # systemctl enable; 笼统说"没有可用的持久化入口"会让人以为白干了.
+  if systemctl enable --now tcpfit-initcwnd.service >/dev/null 2>&1 &&
+     systemctl is-enabled tcpfit-initcwnd.service >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "已生成 $INITCWND_UNIT, 但 systemd 没接受它."
+  echo "  手动启用:  systemctl enable --now tcpfit-initcwnd.service"
+  return 1
+}
+
+write_ppp_hook(){   # write_ppp_hook <网卡名> [窗口 token...]
+  # 网卡名显式传进来, 不靠 bash 动态作用域去蹭调用方的 local iface ——
+  # 那种隐式依赖一改调用方就静默失效.
+  # 窗口值也要能指定: 恢复存档时用的是存档里的值, 不一定是 32.
+  local iface="$1"; shift
+  local -a win=("$@")
+  # 没显式给窗口值时, 优先读上次实际写入的那份, 再退回 32/32.
+  if [ "${#win[@]}" = 0 ] && [ -s "$INITCWND_VALS" ]; then
+    read -r -a win < "$INITCWND_VALS"
+  fi
+  [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
+  [ -n "$iface" ] || return 1
+  # 两个条件缺一不可, 返回 1 让调用方知道这条持久化路径不可用,
+  # 好去试别的（networkd-dispatcher）, 而不是当成已经持久化了.
+  #   1) 目录存在（取 dirname 不写死路径, 和 ROUTE_HOOK 一致, 测试才能重定向）
+  #   2) 【这块网卡确实是 PPP 设备】—— 只看目录不够: 装了 ppp 包(比如为了
+  #      跑 PPTP/L2TP 客户端)的普通机器也有这个目录, 但它的 eth0 永远不会
+  #      触发 pppd 的 ip-up 事件. 早期版本只查目录, 于是在这种机器上
+  #      回报"窗口已持久化交给 pppd", 实际重启就没了.
+  [ -d "$(dirname "$PPP_HOOK")" ] || return 1
+  iface_is_ppp "$iface" || return 1
+  {
+    printf '#!/bin/sh\nIP_FAMILY=%s\nTCPFIT_ROUTE_TABLE=%s\n' "${IP_FAMILY:--4}" "${TCPFIT_ROUTE_TABLE:-main}"
+    printf '# tcpfit: pppd 每次拨通后执行, $1 = 接口名.\n'
+    printf '# 用 $1 而不是自己查路由 —— 此刻默认路由未必已经装好.\n'
+    printf '# 只认调优时那块网卡: 机器上可能还有别的 ppp 链路(PPTP/L2TP VPN 之类),\n'
+    printf '# 不加这道判断的话, VPN 一连上就会被套上给 WAN 算的限速值.\n'
+    printf '[ "$1" = %s ] || exit 0\n' "$(printf '%q' "$iface")"
+    printf '[ -x %s ] && TCPFIT_IF="$1" %s >/dev/null 2>&1\n' \
+           "$(printf '%q' "$QDISC_SCRIPT")" "$(printf '%q' "$QDISC_SCRIPT")"
+    printf '# initcwnd: 沿用新路由的全部 token, 只补窗口字段（只在 tcpfit 设过时才做）\n'
+    printf 'if [ -f %s ]; then\n' "$(printf '%q' "$INITCWND_MARKER")"
+    printf '  owner=$(cat %s)\n' "$(printf '%q' "$INITCWND_MARKER")"
+    printf '  [ -z "$owner" ] || [ "$owner" = "%s %s %s" ] || exit 0\n' "${IP_FAMILY:--4}" "${TCPFIT_ROUTE_TABLE:-main}" "$iface"
+    printf '# 必须按 $1 筛选默认路由, 不能取第一条 —— 多出口机器上第一条\n'
+    printf '# 可能是别的网卡(metric 更低), 那样会给 eth1 加窗口, ppp0 反而没加.\n'
+    cat <<'H'
+  R=$(ip ${IP_FAMILY:--4} route show table ${TCPFIT_ROUTE_TABLE:-main} default 2>/dev/null |
+      awk -v d="$1" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}')
+  if [ -n "$R" ]; then
+    C=$(printf '%s' "$R" | awk '{o="";for(i=1;i<=NF;i++){if($i=="initcwnd"||$i=="initrwnd"||$i=="table"){i++;continue};if($i=="expires"){sub(/sec$/,"",$(i+1))};o=o" "$i};print o}')
+H
+    printf '    [ -n "$C" ] && exec ip ${IP_FAMILY:--4} route replace table ${TCPFIT_ROUTE_TABLE:-main} $C%s 2>/dev/null\n' "$(printf ' %s' "${win[@]}")"
+    printf '  fi\nfi\nexit 0\n'
+  } > "$PPP_HOOK" || return 1
+  chmod 755 "$PPP_HOOK"
+}
+
+# systemd-networkd 是否真的在管这块网卡. 只看 /etc/networkd-dispatcher 在不在不够:
+# Ubuntu 默认装着 networkd-dispatcher, 网却可能是 ifupdown / NetworkManager 管的 ——
+# 那样钩子永远不会被触发, 而早期版本据此报"已持久化", 单元兜底也被跳过.
+networkd_manages(){   # networkd_manages <网卡>
+  [ -n "${1:-}" ] || return 1
+  command -v networkctl >/dev/null 2>&1 || return 1
+  systemctl is-active -q systemd-networkd 2>/dev/null || return 1
+  # configuring 也算: networkd 正在(重新)配置这块网卡, 同样是它在管.
+  # 只认 configured 时容器实测偶发落空 —— 赶上 networkd 刚好在重配, 就退到了只在开机跑的单元.
+  # 不能写成 `networkctl status | grep -q`: grep 一匹配就退出关管道, 真机上 status 输出很长
+  # (末尾还带日志), networkctl 往关掉的管道里写被 SIGPIPE 杀掉(141), pipefail 下整条判失败.
+  # 容器里输出短测不出来, 本机实跑才暴露 —— 先存变量再查.
+  local st
+  st=$(LC_ALL=C networkctl status "$1" 2>/dev/null) || return 1
+  grep -Eq 'State: [a-z-]+ \((configured|configuring)' <<< "$st"
+}
+
+# 把窗口写进 networkd 的 drop-in, 让 DHCP 下发的默认路由自带. 三个前提缺一不可:
+#   1) systemd >= 255 —— [DHCPv4] 里的 InitialCongestionWindow= 是 255 才加的,
+#      249(Ubuntu 22.04)会报 Unknown key 并忽略
+#   2) 当前默认路由是 DHCP 下发的(proto dhcp). 静态 Gateway= 要改 [Route] 段,
+#      等于改写用户自己的路由定义, 不碰
+#   3) 找得到这块网卡用的 .network 文件(netplan 生成在 /run/systemd/network)
+# 不 reload networkd: reload 会重配网卡, 生产机上不值得冒这个险. 运行时的窗口
+# 调用方已经直接设好了, drop-in 管的是 networkd 下一次(重启 / 续租 / 开机)装路由.
+write_networkd_dropin(){   # write_networkd_dropin <网卡> [窗口 token...]
+  local iface="$1"; shift
+  local ver nf dir route cw="" rw=""
+  [ "${IP_FAMILY:--4}" = -4 ] && [ "${TCPFIT_ROUTE_TABLE:-main}" = main ] || return 1
+  ver=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2+0}')
+  [ "${ver:-0}" -ge 255 ] 2>/dev/null || return 1
+  route=$(ip ${IP_FAMILY:--4} route show table ${TCPFIT_ROUTE_TABLE:-main} default 2>/dev/null |
+          awk -v d="$iface" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}')
+  case " $route " in *" proto dhcp "*) ;; *) return 1 ;; esac
+  nf=$(LC_ALL=C networkctl status "$iface" 2>/dev/null) || return 1      # 同 networkd_manages: 先存再查
+  nf=$(awk -F': ' '/Network File:/{print $2; exit}' <<< "$nf")
+  case "$nf" in /*.network) ;; *) return 1 ;; esac
+  # 一个 .network 文件可能匹配多块网卡；共享文件改用按接口执行的钩子。
+  local device other_file
+  for device in /sys/class/net/*; do
+    [ -e "$device" ] || continue
+    [ "${device##*/}" != "$iface" ] || continue
+    other_file=$(LC_ALL=C networkctl status "${device##*/}" 2>/dev/null) || continue
+    other_file=$(awk -F': ' '/Network File:/{print $2; exit}' <<< "$other_file")
+    [ "$other_file" != "$nf" ] || return 1
+  done
+  while [ $# -ge 2 ]; do
+    case "$1" in initcwnd) cw="$2" ;; initrwnd) rw="$2" ;; esac
+    shift 2
+  done
+  [ -n "$cw$rw" ] || return 1
+  dir="$NETWORKD_DIR/${nf##*/}.d"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  {
+    printf '# tcpfit: networkd 每次装 DHCP 默认路由时自带窗口. 删掉这个文件即还原.\n'
+    printf '[DHCPv4]\n'
+    if [ -n "$cw" ]; then printf 'InitialCongestionWindow=%s\n' "$cw"; fi
+    if [ -n "$rw" ]; then printf 'InitialAdvertisedReceiveWindow=%s\n' "$rw"; fi
+  } > "$dir/$INITCWND_DROPIN_NAME" || { rm -f "$dir/$INITCWND_DROPIN_NAME"; return 1; }
+  INITCWND_DROPIN_PATH="$dir/$INITCWND_DROPIN_NAME"
+}
+
+# networkd-dispatcher 钩子: 网卡变成 routable 时写回窗口. 只认调优时那块网卡,
+# 沿用现有路由的全部 token, 只换窗口字段（和单元脚本同一套写法）.
+write_dispatcher_hook(){   # write_dispatcher_hook <网卡> [窗口 token...]
+  local iface="$1" tmp; shift
+  [ -d "$(dirname "$ROUTE_HOOK")" ] || return 1
+  tmp=$(mktemp "${ROUTE_HOOK}.XXXXXX" 2>/dev/null) || return 1
+  {
+    printf '#!/bin/sh\nIP_FAMILY=%s\nTCPFIT_ROUTE_TABLE=%s\n' "${IP_FAMILY:--4}" "${TCPFIT_ROUTE_TABLE:-main}"
+    printf '# tcpfit: 网卡变成 routable 时写回路由窗口. 沿用现有路由的全部 token, 只换窗口字段.\n'
+    printf 'R=$(ip ${IP_FAMILY:--4} route show table ${TCPFIT_ROUTE_TABLE:-main} default 2>/dev/null |\n'
+    printf '    awk -v d=%s \x27{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}\x27)\n' \
+           "$(printf '%q' "$iface")"
+    printf '[ -n "$R" ] || exit 0\n'
+    cat <<'IH'
+C=$(printf '%s' "$R" | awk '{o="";for(i=1;i<=NF;i++){if($i=="initcwnd"||$i=="initrwnd"||$i=="table"){i++;continue};if($i=="expires"){sub(/sec$/,"",$(i+1))};o=o" "$i};print o}')
+IH
+    printf '[ -n "$C" ] && exec ip ${IP_FAMILY:--4} route replace table ${TCPFIT_ROUTE_TABLE:-main} $C%s 2>/dev/null\n' "$(printf ' %s' "$@")"
+    printf 'exit 0\n'
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 755 "$tmp" && mv -- "$tmp" "$ROUTE_HOOK" || { rm -f "$tmp"; return 1; }
+}
+
+# 钩子写了不等于有人执行. Ubuntu 的 networkd-dispatcher 单元带
+# ConditionPathExistsGlob=|/etc/networkd-dispatcher/*/*: 开机时一个钩子都没有就被跳过,
+# 之后一直不跑 —— 实测本机 9/27 写的钩子到 9/30 窗口被冲掉都没执行过.
+# 现在钩子有了, 把它拉起来; 管理员禁用了它就不碰, 换别的路.
+dispatcher_running(){
+  systemctl is-enabled -q networkd-dispatcher 2>/dev/null || return 1
+  systemctl start networkd-dispatcher >/dev/null 2>&1 || true
+  systemctl is-active -q networkd-dispatcher 2>/dev/null
+}
+
+# 撤掉路由窗口的开机持久化入口: dispatcher 钩子、tcpfit-initcwnd 单元和脚本、networkd drop-in.
+# PPP 钩子不在这里删 —— 它还负责重拨后重建整形, 删不删由调用方定.
+# 删过 drop-in 会置 INITCWND_DROPIN_REMOVED=1(不在这里清零: 存档恢复会连调两次), 调用方据此提醒.
+remove_initcwnd_persistence(){
+  local f rc=0
+  rm -f "$ROUTE_HOOK" "$INITCWND_SCRIPT" || rc=1
+  # `|| true` 不能省 —— 单元不存在时 disable 返回非零, 调用方开了 set -e 就会中止.
+  if [ -e "$INITCWND_UNIT" ] || [ -L "$INITCWND_UNIT" ]; then
+    systemctl disable --now tcpfit-initcwnd.service >/dev/null 2>&1 || return 1
+  fi
+  rm -f "$INITCWND_UNIT" || rc=1
+  for f in "$NETWORKD_DIR"/*.network.d/"$INITCWND_DROPIN_NAME"; do
+    [ -e "$f" ] || continue
+    rm -f "$f" || rc=1
+    INITCWND_DROPIN_REMOVED=1
+    rmdir "${f%/*}" 2>/dev/null || true     # 目录里还有用户自己的 drop-in 就留着
+  done
+  return "$rc"
+}
+
+# networkd 不会马上重读 drop-in(不 reload, 见 write_networkd_dropin). 写、改、删之后提醒一句.
+# 说"可能": 重跑 tune 写的是同一份内容时, networkd 可能早就载入过了.
+networkd_pending_note(){
+  echo "  networkd 没有重载(重载会短暂重配网卡), 下次重启或开机后才完全按新配置;"
+  echo "  在那之前网卡断开重连时, 路由上的窗口可能暂时不对."
+}
+
+# 路由窗口的开机持久化. 按可靠性挑一条, 先清掉其他路留下的入口 ——
+# 切换方式时旧入口还在的话, 开机时两边各写一遍, 谁后跑谁赢.
+#   1) PPP 网卡                          → pppd 的 ip-up 钩子(每次拨通都跑)
+#   2) networkd 管的 DHCP 网卡, systemd >= 255 → .network drop-in(networkd 重启 / 续租都不丢)
+#   3) networkd 管的其他网卡              → dispatcher 钩子, 且 dispatcher 必须真的在跑.
+#      已知缺口: networkd 重启时链路一直是 routable, 钩子不触发, 要到网卡重连或开机才补回
+#   4) 其他有 systemd 的机器              → tcpfit-initcwnd.service, 只在开机跑
+# tune 和存档恢复共用这一套 —— 两边各写一份时已经分歧过两次.
+persist_initcwnd(){   # persist_initcwnd <网卡> [窗口 token...] ; 成功时 INITCWND_VIA 写明走的哪条
+  local iface="$1"; shift
+  local -a win=("$@")
+  [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
+  INITCWND_VIA=""
+  remove_initcwnd_persistence || return 1
+  if write_ppp_hook "$iface" "${win[@]}"; then
+    INITCWND_VIA="pppd 的 ip-up 钩子"; return 0
+  fi
+  if networkd_manages "$iface"; then
+    if write_networkd_dropin "$iface" "${win[@]}"; then
+      INITCWND_VIA="systemd-networkd 配置 $INITCWND_DROPIN_PATH"; return 0
+    fi
+    if write_dispatcher_hook "$iface" "${win[@]}" && dispatcher_running; then
+      INITCWND_VIA="networkd-dispatcher 钩子"; return 0
+    fi
+    rm -f "$ROUTE_HOOK"      # 没人执行的钩子别留着冒充持久化
+  fi
+  if write_initcwnd_unit "$iface" "${win[@]}"; then
+    INITCWND_VIA="tcpfit-initcwnd.service（只在开机时执行）"; return 0
+  fi
+  return 1
+}
+
 write_qdisc(){
   local rate="$1" iface="$2"
+  local pinned="${TCPFIT_IF:-}"
+  mkdir -p "$STATE_DIR" && printf '%s\n' "$iface" > "$STATE_DIR/qdisc.iface" || return 1
   cat > "$QDISC_SCRIPT" <<EOF
 #!/bin/bash
 # 网卡名动态探测. 写死的话, 服务商换宿主/换槽位导致网卡改名之后
 # 脚本就一直 "Cannot find device" —— 用户只看到服务 failed, 看不出原因.
 # 探测不到才回退到生成时的名字.
-IF=\$(ip -o -4 route show default 2>/dev/null | awk '{print \$5; exit}')
+IF=\${TCPFIT_IF:-${pinned}}
+[ -n "\$IF" ] || IF=\$(ip -o -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
 [ -n "\$IF" ] || IF=${iface}
 RATE=\${1:-${rate}}
 BURST=\$(awk -v r="\$RATE" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%d",v}')
@@ -2014,7 +2352,8 @@ EOF
   systemctl daemon-reload >/dev/null 2>&1
   # 用 --now 而不是只 enable：否则 tc 规则虽已生效, systemctl is-active 却显示
   # inactive, status 里看着像坏了. 让 unit 状态和实际状态一致.
-  systemctl enable --now tcpfit-qdisc.service >/dev/null 2>&1
+  systemctl enable --now tcpfit-qdisc.service >/dev/null 2>&1 || return 1
+  if iface_is_ppp "$iface"; then write_ppp_hook "$iface" || return 1; fi
 }
 
 cmd_shape(){
@@ -2051,7 +2390,7 @@ cmd_shape(){
   # 校验必须在 take_snapshot 之前 —— 否则打错一个字就会留下快照和半截 qdisc
   is_posint "$rate" 1 100000 || die "--rate 必须是 1-100000 的整数（Mbit）"
   take_snapshot
-  write_qdisc "$rate" "$iface"
+  write_qdisc "$rate" "$iface" || return 1
   systemctl restart tcpfit-qdisc.service 2>/dev/null || "$QDISC_SCRIPT" "$rate"
   # 事后用 tc 核对, 不能只看命令有没有报错.
   # 【不能】直接 grep "rate ${rate}Mbit" —— tc 对除得尽的值会换成 Gbit 显示:
@@ -3073,16 +3412,17 @@ detect_return_server(){
 
 cmd_return(){
   local server="" server_bw="" client_bw="" control_port=12223 iperf_port=12224 role=proxy yes=0 ttl=600
-  local family_given=0 args=() choice repeats=2 repeats_given=0
+  local family_given=0 args=() choice repeats=2 repeats_given=0 traffic_limit=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --server|--server-bw|--client-bw|--control-port|--iperf-port|--role|--token-ttl|--repeats)
+      --server|--server-bw|--client-bw|--control-port|--iperf-port|--role|--token-ttl|--repeats|--traffic-limit-gb)
         [ $# -ge 2 ] || die "$1 缺少参数"
         case "$1" in
           --server) server="$2" ;; --server-bw) server_bw="$2" ;; --client-bw) client_bw="$2" ;;
           --control-port) control_port="$2" ;; --iperf-port) iperf_port="$2" ;;
           --role) role="$2" ;; --token-ttl) ttl="$2" ;;
           --repeats) repeats="$2"; repeats_given=1 ;;
+          --traffic-limit-gb) traffic_limit="$2" ;;
         esac
         shift 2 ;;
       -4|-6) IP_FAMILY="$1"; family_given=1; shift ;;
@@ -3092,6 +3432,7 @@ cmd_return(){
           '       [--control-port 端口] [--iperf-port 端口] [--role proxy|bulk|mixed] [-4|-6] [--yes]' \
           '       [--token-ttl 600]（30-1800 秒，配对成功即失效）' \
           '       [--repeats 2]（每次评估共测 1-10 次，缓冲区只测单连接）' \
+          '       [--traffic-limit-gb GB]（可选正整数预算，逐次检查，达到后选择已有配置）' \
           '服务器地址自动探测，失败后才需手动填写；也可用 --server 指定。' \
           '接入端口默认为 TCP 12223，测速端口默认为 TCP 12224，无需填写。' \
           '填写标称带宽时取已填值中的较小值；两端都留空时自动用四连接探测带宽。' \
@@ -3137,6 +3478,7 @@ cmd_return(){
   is_posint "$repeats" 1 10 || die "测速次数必须是 1-10 的整数"
   [ -z "$server_bw" ] || is_posint "$server_bw" 1 1000000 || die "服务器标称带宽必须是 1-1000000 Mbps 的整数"
   [ -z "$client_bw" ] || is_posint "$client_bw" 1 1000000 || die "家宽标称带宽必须是 1-1000000 Mbps 的整数"
+  [ -z "$traffic_limit" ] || is_posint "$traffic_limit" 1 1000000 || die "流量预算必须是 1-1000000 GB 的整数"
   case "$role" in proxy|bulk|mixed) ;; *) die "用途必须是 proxy / bulk / mixed" ;; esac
   echo
   _conf "服务器地址" "$server（IPv${IP_FAMILY#-}）"
@@ -3146,6 +3488,7 @@ cmd_return(){
   _conf "接入 / 测速端口" "$control_display / $iperf_display TCP"
   _conf "服务器 / 家宽标称" "${server_bw:-未知} / ${client_bw:-未知} Mbps"
   _conf "测试方式" "单连接，每组 $repeats 次"
+  [ -z "$traffic_limit" ] || _conf "测速流量预算" "$traffic_limit GB（逐次检查，达到后停止后续测速）"
   _conf "缓冲区试调" "1.5 × BDP 起步，最高 2.5 × BDP，初值不稳定继续试调，不限轮数和总时长"
   if [ "$yes" = 0 ]; then confirm "  开始并等待家宽接入？" y || { info "已取消"; return 0; }; fi
   return_dependencies || die "依赖准备失败，未开始测速"
@@ -3156,6 +3499,7 @@ cmd_return(){
   [ "$yes" = 0 ] || args+=(--yes)
   [ -z "$server_bw" ] || args+=(--server-bw "$server_bw")
   [ -z "$client_bw" ] || args+=(--client-bw "$client_bw")
+  [ -z "$traffic_limit" ] || args+=(--traffic-limit-gb "$traffic_limit")
   python3 "$RETURN_HELPER" "${args[@]}" &
   local pid=$! rc=0
   trap 'kill -INT "$pid" 2>/dev/null || :' INT
